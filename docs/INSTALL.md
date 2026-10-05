@@ -98,7 +98,10 @@ The same idea, in a container (NVIDIA cards).
    The default covers RTX 30 (86), RTX 40 (89), RTX 50 (120) and A-series (80); a card outside that
    set needs a rebuild with its own arch. Add `--build-arg BUILD_VISION=0` to skip the image encoder.
 3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
-   `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`
+   Export a strong `STRATA_API_KEY` in your shell, then pass its name to Docker:
+   `docker run --rm --gpus all -p 127.0.0.1:8080:8080 -e STRATA_API_KEY --ulimit memlock=-1 -v strata-data:/data strata`
+   Enter that key in Strata's web app or your API client. The example publishes to the host's loopback address;
+   keep the key even for this mapping because the server also listens on the container network.
 
    The setup choices are env vars: `-e MODEL=IQ2_XS -e FAMILY=qwen -e CONTEXT=32768 -e VISION=no`
    (or `MODEL=Q2_0|IQ3_XXS|IQ3_S`, `FAMILY=swift|coder`; the defaults above are the recommended ones).
@@ -107,8 +110,11 @@ The same idea, in a container (NVIDIA cards).
    Only the model files, the prepared pack, the MTP layer and the install config live in the
    `strata-data` volume; the engine is part of the image. Switching between models already on the
    volume needs no setup pass: `-e MODEL=Q2_0 -e FAMILY=coder` picks that model's config. Add
-   `-e REINSTALL=1` only to change settings for a model already set up (context, vision, KV, host,
-   api_key, LOW_RAM), since those are recorded in its config.
+   `-e REINSTALL=1` only to change settings for a model already set up (context, vision, KV,
+   LOW_RAM), since those are recorded in its config. `HOST` and `STRATA_API_KEY` apply on every start, including
+   an existing volume; key rotation needs a container restart, not a reinstall. `API_KEY` remains an alias,
+   but conflicting aliases or an explicitly empty key stop startup. Environment keys are not saved to the
+   run config by the entry point: supply the environment again when recreating the container.
    Strata loads 32-62 GB into RAM. `--gpus all` on a host with two usable cards takes both: the
    layer split is setup's recommended default ([MULTI_GPU.md](MULTI_GPU.md)), and a volume
    set up for one card switches to the pair on its first start there. Pin one card with `-e GPU=0`,
@@ -117,8 +123,10 @@ The same idea, in a container (NVIDIA cards).
    keeping them in RAM: setup.py measures the host's RAM, not the container's limit, so it cannot
    see a cap. LOW_RAM runs on one card unless `GPUS` names several (then the experts the cards do not hold are
    read through the OS file cache, which can fill the RAM during long prompts).
-   The server listens on `0.0.0.0:8080` by default; set `-e API_KEY=<secret>` before exposing the port
-   to a network. The image has a `HEALTHCHECK` on `/health`, so `docker ps` shows the container
+   The server listens on `0.0.0.0:8080` by default and requires an API key before setup starts.
+   A key already saved in the selected model's config also works if neither environment variable is set.
+   To publish to your LAN, deliberately change the host side of `-p`; keep authentication enabled.
+   The image has a `HEALTHCHECK` on `/health`, so `docker ps` shows the container
    healthy once the model is loaded, and `GET /v1/status` says what it is running.
 
 ## Older CPUs (experimental)

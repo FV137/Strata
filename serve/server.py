@@ -48,6 +48,9 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+MAX_REQUEST_BODY = 32 * 1024 * 1024
+REQUEST_BODY_TIMEOUT_S = 30.0
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
@@ -55,6 +58,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve.access import api_key_of, require_key_for_bind  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -3081,13 +3085,16 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            controls = ("/settings", "/config", "/load", "/unload", "/v1/load", "/v1/unload", "/v1/vram")
+            body = self._read_body(65536 if path in controls else MAX_REQUEST_BODY,
+                                   2.0 if path in ("/load", "/unload") else REQUEST_BODY_TIMEOUT_S)
+            if body is None:
+                return
             if path == "/settings":
-                self._settings()
+                self._settings(body)
                 return
             if path == "/config":
-                self._config_post()
-                return
-            if path in ("/unload", "/load") and not self._control_body():
+                self._config_post(body)
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
             if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
@@ -3108,7 +3115,7 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                req = json.loads(body or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
@@ -3218,27 +3225,44 @@ def make_handler(svc: Service):
                 props["build_info"] = "Strata " + str(version)
             self._json(200, props)
 
-        def _control_body(self) -> bool:
-            """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
+        def _read_body(self, limit, timeout_s):
+            """Read one bounded body by an absolute deadline, before any parsing or state change."""
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get_all("Transfer-Encoding") or len(lengths) > 1:
+                self._json(400, {"error": {"message": "use a single Content-Length; Transfer-Encoding is not supported"}})
+                return None
+            value = lengths[0].strip() if lengths else "0"
+            if not value or not value.isascii() or not value.isdecimal() or len(value) > 20:
                 self._json(400, {"error": {"message": "invalid Content-Length"}})
-                return False
-            if not 0 <= length <= 65536:
-                self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
-                return False
+                return None
+            length = int(value)
+            if length > limit:
+                self._json(413, {"error": {"message": f"request body is limited to {limit} bytes"}})
+                return None
             timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + timeout_s
+            chunks, left = [], length
             try:
-                self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                while left:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(left, 65536))
+                    if not chunk:
+                        self._json(400, {"error": {"message": "incomplete request body"}})
+                        return None
+                    chunks.append(chunk)
+                    left -= len(chunk)
+            except TimeoutError:
+                self._json(408, {"error": {"message": "request body deadline exceeded"}})
+                return None
             except OSError:
-                complete = False
+                self._json(400, {"error": {"message": "incomplete request body"}})
+                return None
             finally:
                 self.connection.settimeout(timeout)
-            if not complete:
-                self._json(400, {"error": {"message": "incomplete control request body"}})
-            return complete
+            return b"".join(chunks)
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -3268,10 +3292,9 @@ def make_handler(svc: Service):
                 return
             self._json(200, runconfig.view(cfg, svc.config_path))
 
-        def _config_post(self):
+        def _config_post(self, body):
             """#564: change a few documented keys of the run config - JSON from Strata's own page only, as
             /settings (the key is checked before); every other key of the file stays as it is."""
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             if not self._own_page("the run config can be changed"):
                 return
             if not svc.config_path:
@@ -3295,9 +3318,8 @@ def make_handler(svc: Service):
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
 
-        def _settings(self):
+        def _settings(self, body):
             # They change what every client gets, so only the app's own page may set them
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             if not self._own_page("settings can be changed"):
                 return
             try:
@@ -3768,6 +3790,7 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    require_key_for_bind(host, svc.api_key)
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
@@ -3915,7 +3938,7 @@ def main() -> int:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
+    ap.add_argument("--api-key", default=None,
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
@@ -3938,6 +3961,11 @@ def main() -> int:
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
+    try:                                                # fail before binding, loading a model or starting MCP
+        api_key = api_key_of(a.api_key, cfg)
+        require_key_for_bind(a.host, api_key)
+    except ValueError as e:
+        ap.error(str(e))
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
@@ -4022,13 +4050,7 @@ def main() -> int:
         raise SystemExit(f"[strata] config {e}")
     if svc.aliases:
         print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
-    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
-                for i, x in enumerate(sys.argv)):
-        # #213: an empty key would switch authentication off without a word
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
-              file=sys.stderr)
-        return 2
-    svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.api_key = api_key
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
@@ -4104,9 +4126,6 @@ def main() -> int:
             print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
         if not ips:
             print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
-        if not svc.api_key:
-            print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or run "
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "

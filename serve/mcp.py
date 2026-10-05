@@ -248,6 +248,12 @@ class StdioTransport:
             pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Credentials, session IDs and tool arguments belong only to the configured endpoint.
+        return None
+
+
 class HttpTransport:
     """A server at an address (Streamable HTTP): every message is a POST; the answer is JSON or an event stream that
     carries it.  The session id the server hands out at `initialize` rides on every later request."""
@@ -261,6 +267,7 @@ class HttpTransport:
         self.next_id = 0
         self.lock = threading.Lock()
         self.broken = None
+        self.opener = urllib.request.build_opener(_NoRedirect())
 
     def start(self):
         pass
@@ -281,7 +288,7 @@ class HttpTransport:
         try:
             req = urllib.request.Request(self.url, data=json.dumps(msg, ensure_ascii=False).encode("utf-8"),
                                          headers=self._headers(), method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with self.opener.open(req, timeout=timeout) as r:
                 if r.headers.get("Mcp-Session-Id"):
                     self.session = r.headers["Mcp-Session-Id"]
                 if slot is None:                         # a notification: 202, nothing to read
@@ -302,9 +309,11 @@ class HttpTransport:
         except urllib.error.HTTPError as e:
             detail = ""
             try:
-                detail = e.read().decode("utf-8", "replace")[:300]
+                detail = e.read(1200).decode("utf-8", "replace")[:300]
             except OSError:
                 pass
+            finally:
+                e.close()
             if e.code == 404 and self.session:           # the session expired: a restart starts a new one
                 self.broken = McpError("the server ended the session")
             err = McpError(f"HTTP {e.code} {e.reason}{': ' + detail if detail else ''}")
@@ -371,7 +380,7 @@ class HttpTransport:
             return
         try:                                             # end the session on the server (it may not allow that)
             req = urllib.request.Request(self.url, headers=self._headers(), method="DELETE")
-            urllib.request.urlopen(req, timeout=3).close()
+            self.opener.open(req, timeout=3).close()
         except (OSError, ValueError):
             pass
 
