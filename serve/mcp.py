@@ -1,10 +1,11 @@
 """serve/mcp.py - tools from MCP (Model Context Protocol) servers for the web app's chats.
 
-The user lists servers in the run config (`"mcp_servers"`, or Claude Desktop's `"mcpServers"` block pasted as is) or
+The administrator lists servers in the run config (`"mcp_servers"` or `"mcpServers"`) or
 in a separate file (`--mcp-config`).  Each one is either a program Strata starts (`command`, `args`, `env`, `cwd`:
 the stdio transport, newline-delimited JSON-RPC 2.0 on its stdin/stdout) or an address (`url`, `headers`: the
 Streamable HTTP transport, JSON-RPC POSTed, answered as JSON or as an event stream).  Both are implemented here with
-the standard library only; no MCP SDK is needed.
+the standard library only; no MCP SDK is needed. Exact allowed_tools grants are required; stdio defaults to a
+Linux bubblewrap sandbox. See docs/MCP_SECURITY.md for the policy, migration and explicit trusted execution.
 
 `McpHub` owns every configured server: it starts them in the background when the server starts, offers their tools to
 the model as OpenAI function tools named `<server>__<tool>` (two servers may both have a `search`), and routes a call
@@ -20,9 +21,9 @@ from __future__ import annotations
 
 import collections
 import json
+import math
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import urllib.error
 import urllib.request
 
 from serve.winjob import contain
+from serve import mcp_security as security
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}
@@ -72,7 +74,24 @@ def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str
     if "error" in msg:
         err = msg["error"] if isinstance(msg["error"], dict) else {"message": str(msg["error"])}
         raise McpError(f"{err.get('message') or 'error'} (code {err.get('code')})")
-    return msg.get("result") or {}
+    result = msg.get("result") or {}
+    if not isinstance(result, dict):
+        raise McpError("MCP response result must be an object")
+    return result
+
+
+def _transport_config(cfg):
+    try:
+        return security.validate_server(cfg)
+    except ValueError as e:
+        raise McpError(f"invalid MCP configuration: {e}") from None
+
+
+def _authorize(cfg, method, params):
+    try:
+        security.authorize(cfg, method, params)
+    except ValueError as e:
+        raise McpError(str(e)) from None
 
 
 # ------------------------------------------------------------------------------------------------ transports
@@ -81,7 +100,9 @@ class StdioTransport:
     kind = "stdio"
 
     def __init__(self, name: str, cfg: dict):
-        self.name, self.cfg = name, cfg
+        self.name, self.cfg = name, _transport_config(cfg)
+        self.max_response_bytes = self.cfg.get("max_response_bytes", security.DEFAULT_RESPONSE_BYTES)
+        self.terminal_error = None
         self.proc = None
         self.lock = threading.Lock()                    # the pending requests
         self.write_lock = threading.Lock()              # stdin; separate, so a full pipe can't block the reader
@@ -91,22 +112,21 @@ class StdioTransport:
         self.protocol = PROTOCOL
 
     def start(self):
-        env = dict(os.environ)
-        env.update({str(k): str(v) for k, v in (self.cfg.get("env") or {}).items()})
-        command = str(self.cfg["command"])
-        # On Windows `npx`, `uvx` and friends are .cmd files that CreateProcess finds only with their extension
-        exe = shutil.which(command, path=env.get("PATH")) or command
         extra = {}
         if os.name == "nt":
             extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         else:
-            extra["start_new_session"] = True           # its own process group, so close() ends its children too
+            extra["start_new_session"] = True           # close() also ends the process group
         try:
-            self.proc = subprocess.Popen([exe, *[str(a) for a in self.cfg.get("args") or []]], stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.cfg.get("cwd") or None,
-                                         env=env, **extra)
+            with security.launch_command(self.cfg) as (argv, env, cwd, pass_fds):
+                if pass_fds:
+                    extra["pass_fds"] = pass_fds
+                self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             cwd=cwd, env=env, close_fds=True, **extra)
+        except ValueError as e:
+            raise McpError(str(e)) from None
         except OSError as e:
-            raise McpError(f"could not start {command!r}: {e}") from None
+            raise McpError(f"could not start {self.cfg['command']!r}: {e}") from None
         contain(self.proc)                              # ends with the server, however it ends (Windows)
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._err_reader.start()
@@ -116,50 +136,72 @@ class StdioTransport:
         return self.proc is not None and self.proc.poll() is None and not getattr(self, "ended", False)
 
     @staticmethod
-    def _lines(f):
-        """A pipe's lines until it closes (or close() closed it under us)."""
+    def _lines(f, limit):
+        """Bound memory before decoding/parsing, including an unterminated line."""
         try:
-            yield from f
+            while True:
+                raw = f.readline(limit + 1)
+                if not raw:
+                    return
+                if len(raw) > limit:
+                    raise McpError(f"MCP line exceeds the {limit:,}-byte transport limit")
+                yield raw
         except (OSError, ValueError):
             return
 
-    def _read_stderr(self):
-        for raw in self._lines(self.proc.stderr):
-            line = raw.decode("utf-8", "replace").rstrip()
-            if line:
-                self.stderr.append(line)
-                if os.environ.get("STRATA_DEBUG"):
-                    print(f"[mcp {self.name}] {line}", flush=True)
-
-    def _read(self):
-        for raw in self._lines(self.proc.stdout):
-            line = raw.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:                           # a server that prints to stdout; the spec forbids it
-                self.stderr.append(line)
-                continue
-            for m in msg if isinstance(msg, list) else [msg]:
-                if isinstance(m, dict):
-                    self._dispatch(m)
+    def _abort(self, error):
+        self.terminal_error = error
         self.ended = True
-        # the server's last log line says why it stopped: let the stderr reader take it first (the pipe closes with
-        # the process), or the error raced it and said only "the server stopped"
-        self._err_reader.join(1.0)
-        code = self.proc.poll()
-        err = McpError(f"the server stopped{f' (exit code {code})' if code is not None else ''}{self._tail()}")
         with self.lock:
             slots, self.pending = list(self.pending.values()), {}
-        for s in slots:
-            s.error = err
-            s.done.set()
+        for slot in slots:
+            slot.error = error
+            slot.done.set()
+        self._kill_tree(self.proc)
+
+    def _read_stderr(self):
+        try:
+            for raw in self._lines(self.proc.stderr, security.STDERR_LINE_BYTES):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    self.stderr.append(line)
+                    if os.environ.get("STRATA_DEBUG"):
+                        print(f"[mcp {self.name}] {line}", flush=True)
+        except McpError as e:
+            self._abort(e)
+
+    def _read(self):
+        try:
+            for raw in self._lines(self.proc.stdout, self.max_response_bytes):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except (ValueError, RecursionError):
+                    self.stderr.append(line[:security.STDERR_LINE_BYTES])
+                    continue
+                for m in msg if isinstance(msg, list) else [msg]:
+                    if isinstance(m, dict):
+                        self._dispatch(m)
+        except McpError as e:
+            self._abort(e)
+        self.ended = True
+        self._err_reader.join(1.0)
+        code = self.proc.poll()
+        err = self.terminal_error or McpError(f"the server stopped{f' (exit code {code})' if code is not None else ''}{self._tail()}")
+        with self.lock:
+            slots, self.pending = list(self.pending.values()), {}
+        for slot in slots:
+            slot.error = err
+            slot.done.set()
 
     def _tail(self) -> str:
         return f": {self.stderr[-1][:300]}" if self.stderr else ""
 
     def _dispatch(self, m: dict):
+        if "id" in m and (not isinstance(m["id"], (str, int)) or isinstance(m["id"], bool)):
+            raise McpError("invalid MCP JSON-RPC response id")
         if "method" in m:
             if "id" in m:                                # a request from the server: we offer no client features
                 try:
@@ -178,6 +220,7 @@ class StdioTransport:
             slot.done.set()
 
     def _send(self, msg: dict):
+        _authorize(self.cfg, msg.get("method"), msg.get("params"))
         data = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
         try:
             with self.write_lock:
@@ -187,7 +230,10 @@ class StdioTransport:
             raise McpError(f"the server stopped{self._tail()}") from None
 
     def request(self, method: str, params: dict, timeout: float, cancel=None):
+        _authorize(self.cfg, method, params)
         if not self.alive():
+            if self.terminal_error:
+                raise self.terminal_error
             raise McpError(f"the server is not running{self._tail()}")
         slot = _Slot()
         with self.lock:
@@ -197,13 +243,14 @@ class StdioTransport:
         try:
             self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             return _wait(slot, timeout, cancel, method)
-        except (McpTimeout, McpCancelled) as e:
+        except McpError as e:
             with self.lock:
                 self.pending.pop(rid, None)
-            try:                                         # tell the server to stop working on it
-                self.notify("notifications/cancelled", {"requestId": rid, "reason": str(e)})
-            except McpError:
-                pass
+            if isinstance(e, (McpTimeout, McpCancelled)):
+                try:
+                    self.notify("notifications/cancelled", {"requestId": rid, "reason": str(e)})
+                except McpError:
+                    pass
             raise
 
     def notify(self, method: str, params: dict | None = None):
@@ -231,7 +278,7 @@ class StdioTransport:
     @staticmethod
     def _kill_tree(p):
         try:
-            if os.name == "nt":                          # npx.cmd -> node: end the whole tree
+            if os.name == "nt":                          # end the whole trusted process tree
                 subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=10)
             else:
@@ -260,14 +307,16 @@ class HttpTransport:
     kind = "http"
 
     def __init__(self, name: str, cfg: dict):
-        self.name, self.url = name, str(cfg["url"])
+        self.cfg = _transport_config(cfg)
+        self.max_response_bytes = self.cfg.get("max_response_bytes", security.DEFAULT_RESPONSE_BYTES)
+        self.name, self.url = name, self.cfg["url"]
         self.headers = {str(k): str(v) for k, v in (cfg.get("headers") or {}).items()}
         self.session = None
         self.protocol = None                             # sent as MCP-Protocol-Version once negotiated
         self.next_id = 0
         self.lock = threading.Lock()
         self.broken = None
-        self.opener = urllib.request.build_opener(_NoRedirect())
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def start(self):
         pass
@@ -286,6 +335,7 @@ class HttpTransport:
 
     def _post(self, msg: dict, rid, timeout: float, slot: _Slot | None):
         try:
+            _authorize(self.cfg, msg.get("method"), msg.get("params"))
             req = urllib.request.Request(self.url, data=json.dumps(msg, ensure_ascii=False).encode("utf-8"),
                                          headers=self._headers(), method="POST")
             with self.opener.open(req, timeout=timeout) as r:
@@ -297,7 +347,9 @@ class HttpTransport:
                 if "text/event-stream" in ctype:
                     found = self._from_events(r, rid)
                 else:
-                    body = r.read()
+                    body = r.read(self.max_response_bytes + 1)
+                    if len(body) > self.max_response_bytes:
+                        raise McpError(f"MCP HTTP response exceeds the {self.max_response_bytes:,}-byte transport limit")
                     found = None
                     parsed = json.loads(body) if body.strip() else None
                     for m in parsed if isinstance(parsed, list) else [parsed]:
@@ -320,7 +372,7 @@ class HttpTransport:
             if slot is None:
                 raise err from None
             slot.error = err
-        except (OSError, ValueError, McpError) as e:
+        except (OSError, ValueError, RecursionError, McpError) as e:
             err = e if isinstance(e, McpError) else McpError(f"could not reach {self.url}: {e}")
             if slot is None:
                 raise err from None
@@ -329,11 +381,16 @@ class HttpTransport:
             if slot is not None:
                 slot.done.set()
 
-    @staticmethod
-    def _from_events(r, rid):
+    def _from_events(self, r, rid):
         """Read the event stream until the event that answers `rid` (it may carry notifications first)."""
-        data = []
-        for raw in r:
+        data, consumed = [], 0
+        while True:
+            raw = r.readline(self.max_response_bytes - consumed + 1)
+            if not raw:
+                break
+            consumed += len(raw)
+            if consumed > self.max_response_bytes:
+                raise McpError(f"MCP event stream exceeds the {self.max_response_bytes:,}-byte transport limit")
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
@@ -349,6 +406,7 @@ class HttpTransport:
         return None
 
     def request(self, method: str, params: dict, timeout: float, cancel=None):
+        _authorize(self.cfg, method, params)
         if self.broken:
             raise self.broken
         with self.lock:
@@ -390,7 +448,7 @@ class McpServer:
     """One configured server: started once (and again after it stopped), with the tools it listed."""
 
     def __init__(self, name: str, cfg: dict, settings: dict):
-        self.name, self.cfg, self.settings = name, cfg, settings
+        self.name, self.cfg, self.settings = name, _check_server(name, cfg, "MCP configuration"), settings
         self.kind = "http" if cfg.get("url") else "stdio"
         self.status = "idle"             # idle -> starting -> ready | failed; ready -> stopped when it ends
         self.error = None
@@ -409,6 +467,9 @@ class McpServer:
             self.transport.close()
         self.status, self.error, self.last_start = "starting", None, time.monotonic()
         t = HttpTransport(self.name, self.cfg) if self.kind == "http" else StdioTransport(self.name, self.cfg)
+        # One live administrator policy for server and transport checks, so a
+        # revoked permission cannot survive in a cached transport configuration.
+        t.cfg = self.cfg
         self.transport = t
         timeout = float(self.settings["start_timeout_s"])
         try:
@@ -417,7 +478,10 @@ class McpServer:
                                            "clientInfo": {"name": "strata", "title": "Strata", "version": "1"}},
                             timeout)
             t.protocol = str(res.get("protocolVersion") or PROTOCOL)
-            self.info = {k: v for k, v in (res.get("serverInfo") or {}).items() if k in ("name", "title", "version")}
+            info = res.get("serverInfo", {})
+            if not isinstance(info, dict):
+                raise McpError("invalid MCP serverInfo: expected an object")
+            self.info = {k: v for k, v in info.items() if k in ("name", "title", "version")}
             self.info["protocol"] = t.protocol
             t.notify("notifications/initialized")
             tools, cursor = [], None
@@ -428,7 +492,8 @@ class McpServer:
                     if "code -32601" in str(e) and not tools:   # a server without tools (prompts/resources only)
                         break
                     raise
-                tools += [x for x in page.get("tools") or [] if isinstance(x, dict) and x.get("name")]
+                tools += [x for x in page.get("tools") or []
+                          if isinstance(x, dict) and security.tool_allowed(self.cfg, x.get("name"))]
                 cursor = page.get("nextCursor")
                 if not cursor:
                     break
@@ -445,6 +510,7 @@ class McpServer:
             return False
 
     def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
+        _authorize(self.cfg, "tools/call", {"name": tool})
         with self.lock:
             if self.transport is None or not self.transport.alive():
                 # it stopped since its last call (a crash, an expired session): start it again; one that failed to
@@ -454,6 +520,11 @@ class McpServer:
                 print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
                 if not self._start():
                     raise McpError(f"the server could not be started again: {self.error}")
+            # Recheck after a restart/discovery; stale hub routes never authorize
+            # a tool that the administrator revoked or the server no longer lists.
+            _authorize(self.cfg, "tools/call", {"name": tool})
+            if not any(item.get("name") == tool for item in self.tools):
+                raise McpError("MCP tool is no longer available")
             t = self.transport
         try:
             return t.request("tools/call", {"name": tool, "arguments": arguments}, timeout, cancel)
@@ -504,13 +575,13 @@ class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
     def __init__(self, servers: dict[str, dict], settings: dict | None = None):
-        self.settings = {**DEFAULTS, **(settings or {})}
+        self.settings = {**DEFAULTS, **settings_from({"mcp": settings if settings is not None else {}})}
         self.servers = {name: McpServer(name, cfg, self.settings) for name, cfg in servers.items()}
         self.threads: list[threading.Thread] = []
         self._routes: dict[str, tuple[McpServer, str]] = {}
 
     def start(self, wait: bool = False):
-        """Start every server on its own thread (npx may download a package first: that must not delay the chat)."""
+        """Start each configured server on its own thread without delaying chat startup."""
         self.threads = [threading.Thread(target=s.start, daemon=True, name=f"mcp-{s.name}")
                         for s in self.servers.values()]
         for t in self.threads:
@@ -532,6 +603,8 @@ class McpHub:
             if s.status not in ("ready", "stopped"):
                 continue
             for t in s.tools:
+                if not security.tool_allowed(s.cfg, t.get("name")):
+                    continue
                 name = f"{_clean(s.name)}__{_clean(t['name'])}"[:64]
                 n = 2
                 while name in out:                       # two names that differ only in cleaned characters
@@ -594,7 +667,8 @@ class McpHub:
             servers.append({"name": s.name, "transport": s.kind, "status": s.status, "error": s.error,
                             "info": s.info,
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
-                                       "description": str(t.get("description") or "")[:300]} for t in s.tools]})
+                                       "description": str(t.get("description") or "")[:300]} for t in s.tools
+                                      if security.tool_allowed(s.cfg, t.get("name"))]})
         return {"servers": servers, "tools": len(routes),
                 "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
 
@@ -608,22 +682,10 @@ class McpHub:
 
 # ------------------------------------------------------------------------------------------------ config
 def _check_server(name, cfg, where) -> dict:
-    if not isinstance(cfg, dict):
-        raise SystemExit(f"[strata] {where}: MCP server {name!r} must be an object with \"command\" or \"url\"")
-    if cfg.get("url"):
-        if cfg.get("type") == "sse":
-            raise SystemExit(f"[strata] {where}: MCP server {name!r} uses the old SSE transport (\"type\": \"sse\"); "
-                             "Strata speaks Streamable HTTP - most servers offer it at /mcp")
-        if not isinstance(cfg.get("headers") or {}, dict):
-            raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"headers\" must be an object")
-        return cfg
-    if not isinstance(cfg.get("command"), str) or not cfg["command"].strip():
-        raise SystemExit(f"[strata] {where}: MCP server {name!r} needs \"command\" (a program to start) or \"url\"")
-    if not isinstance(cfg.get("args") or [], list):
-        raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"args\" must be a list")
-    if not isinstance(cfg.get("env") or {}, dict):
-        raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"env\" must be an object")
-    return cfg
+    try:
+        return security.validate_server(cfg)
+    except ValueError as e:
+        raise SystemExit(f"[strata] {where}: MCP server {name!r}: {e}") from None
 
 
 def servers_from(block, where: str) -> dict[str, dict]:
@@ -639,8 +701,11 @@ def servers_from(block, where: str) -> dict[str, dict]:
 def settings_from(cfg: dict) -> dict:
     """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s."""
     out = {}
-    for key, value in (cfg.get("mcp") or {}).items():
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    settings = cfg.get("mcp", {})
+    if not isinstance(settings, dict):
+        raise SystemExit("[strata] config mcp must be an object")
+    for key, value in settings.items():
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
         if key in ("timeout_s", "start_timeout_s"):
             if not number or value <= 0:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")
@@ -650,7 +715,7 @@ def settings_from(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a positive integer")
             out[key] = int(value)
         else:
-            print(f"[strata] config mcp.{key}={value!r}: unknown key, ignored", flush=True)
+            raise SystemExit(f"[strata] config mcp.{key}: unknown key")
     return out
 
 

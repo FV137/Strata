@@ -28,7 +28,8 @@ CTX = 8192
 
 
 def stdio(*args, **extra):
-    return {"command": sys.executable, "args": [FAKE, *args], **extra}
+    return {"command": sys.executable, "args": [FAKE, *args], "execution": "trusted",
+            "allowed_tools": [t["name"] for t in fake.TOOLS], "inherit_env": ["FAKE_MCP_LOG"], **extra}
 
 
 def call_script(name, **params):
@@ -62,7 +63,7 @@ class Client(unittest.TestCase):
         cls.log.close()
         os.environ["FAKE_MCP_LOG"] = cls.log.name
         cls.hub = McpHub({"fake": stdio(), "paged": stdio("--page", "4"), "broken": stdio("--crash-at-start"),
-                          "missing": {"command": "strata-no-such-program"}},
+                          "missing": {"command": "strata-no-such-program", "execution": "trusted", "allowed_tools": []}},
                          {"timeout_s": 1.5, "max_result_chars": 1000})
         cls.hub.start(wait=True)
 
@@ -114,11 +115,11 @@ class Client(unittest.TestCase):
         self.assertEqual(r["text"], "error: it failed on purpose")
         r = self.hub.call("nobody__nothing", {})                    # not a tool at all
         self.assertTrue(r["text"].startswith("error: there is no tool"))
-        # a JSON-RPC error from the server
+        # an unknown tool is denied locally before the server sees the call
         s = self.hub.servers["fake"]
         with self.assertRaises(Exception) as ctx:
             s.call("no-such-tool", {}, 5)
-        self.assertIn("unknown tool", str(ctx.exception))
+        self.assertIn("not allowed", str(ctx.exception))
 
     def test_timeout(self):
         self.hub.routes()
@@ -175,7 +176,7 @@ class HttpClient(unittest.TestCase):
     def setUpClass(cls):
         cls.httpd = fake.http_server(0)
         url = f"http://127.0.0.1:{cls.httpd.server_address[1]}/mcp"
-        cls.hub = McpHub({"web": {"url": url}, "down": {"url": "http://127.0.0.1:9/mcp"}}, {"timeout_s": 1.5})
+        cls.hub = McpHub({"web": {"url": url, "allowed_tools": [t["name"] for t in fake.TOOLS]}, "down": {"url": "http://127.0.0.1:9/mcp"}}, {"timeout_s": 1.5})
         cls.hub.start(wait=True)
 
     @classmethod
