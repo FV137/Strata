@@ -1,5 +1,5 @@
-"""Tests for setup.py's reproducible installs (#214): the engine of the checkout's own release first (the latest as
-the fallback), Hugging Face files at pinned revisions (the current files when a revision is gone), the pinned
+"""Tests for setup.py's reproducible installs: one verified engine release with no latest fallback,
+Hugging Face files at pinned revisions (the current files when a revision is gone), the pinned
 requirements file, and an existing install left as it is.  Mocked network - nothing is downloaded.
 
     python -m unittest tools.test_setup_pins
@@ -7,6 +7,7 @@ requirements file, and an existing install left as it is.  Mocked network - noth
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import re
@@ -156,77 +157,66 @@ class Engine(unittest.TestCase):
             p.stop()
         self.tmp.cleanup()
 
-    def fake_download(self, got):
-        def download(url, dst, what=None):
-            got.append(url)
-            with zipfile.ZipFile(dst, "w") as z:
-                z.writestr("BUILD.json", json.dumps({"version": ".".join(map(str, setup.MIN_ENGINE)), "archs": [89]}))
-                z.writestr(setup.EXE, b"engine")
-        return download
-
-    def run_get(self, published):
-        heads, got = [], []
+    def run_get(self, published, meta=None):
+        seen = []
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("BUILD.json", json.dumps(meta or {"source": "release", "version": "0.1.39",
+                                                        "archs": [89], "cuda": "13.0", "vision": "gpu"}))
+            z.writestr(setup.EXE, b"engine")
+            z.writestr(setup.VEXE, b"encoder")
+        body = archive.getvalue()
+        manifest = self.root / "trusted.json"
+        asset = "strata-windows-x64.zip"
+        manifest.write_text(json.dumps({"artifacts": {asset: {"version": "0.1.39", "size": len(body),
+                                            "sha256": hashlib.sha256(body).hexdigest()}}}))
 
         def urlopen(req, timeout=None):
-            heads.append(req.full_url)
+            seen.append(req.full_url)
             if not any(req.full_url.startswith(p) for p in published):
                 raise not_found(req.full_url)
-            return Response()
+            response = Response(body)
+            response.geturl = lambda: req.full_url
+            return response
 
         with mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
-                mock.patch.object(setup, "download", self.fake_download(got)):
+                mock.patch.object(setup, "WIN", True), mock.patch.object(setup, "PREBUILT_ASSET", asset), \
+                mock.patch.object(setup, "ARTIFACT_MANIFEST", manifest):
             eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
-        return eng, out, heads, got
+        return eng, out, seen
 
     def test_bases(self):
         self.assertEqual(setup.prebuilt_bases(setup.PREBUILT_URL),
-                         ["https://github.com/Niko1221/Strata/releases/download/v0.1.31/", setup.PREBUILT_URL])
+                         ["https://github.com/Niko1221/Strata/releases/download/v0.1.39/"])
         self.assertEqual(setup.prebuilt_bases("https://mirror.example/x"), ["https://mirror.example/x/"])
 
-    def test_the_checkout_s_release_first(self):
-        tag = "https://github.com/Niko1221/Strata/releases/download/v0.1.31/"
-        eng, out, heads, got = self.run_get([tag, setup.PREBUILT_URL])
+    def test_only_the_reviewed_release_is_requested(self):
+        eng, out, seen = self.run_get([setup.PREBUILT_URL])
         self.assertEqual(eng, self.root / "engine")
-        self.assertEqual(got, [tag + setup.PREBUILT_ASSET])
-        self.assertEqual(len(heads), 1)
+        self.assertEqual((eng / setup.EXE).read_bytes(), b"engine")
+        self.assertEqual(seen, ["https://github.com/Niko1221/Strata/releases/download/v0.1.39/strata-windows-x64.zip"])
 
-    def test_latest_when_it_is_not_published(self):
-        eng, out, heads, got = self.run_get([setup.PREBUILT_URL])
-        self.assertEqual(eng, self.root / "engine")
-        self.assertEqual(got, [setup.PREBUILT_URL + setup.PREBUILT_ASSET])
-        self.assertIn("No ready-made engine for v0.1.31", out)
+    def test_unavailable_release_does_not_fall_back_to_latest(self):
+        eng, out, seen = self.run_get(["https://github.com/Niko1221/Strata/releases/latest/download/"])
+        self.assertIsNone(eng)
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("/latest/", seen[0])
+        self.assertFalse((self.root / "engine" / setup.EXE).exists())
 
-    def test_a_refused_archive_is_not_kept(self):
-        """PR #324: a refused archive (too old, or no code for the GPU) kept its zip and .done mark, and every later
-        run reused it ("already downloaded") instead of the published one."""
-        for meta in ({"version": "0.1.0", "archs": [89]},
-                     {"version": ".".join(map(str, setup.MIN_ENGINE)), "archs": [120]}):
+    def test_a_refused_archive_is_not_activated(self):
+        for meta in ({"source": "release", "version": "0.1.0", "archs": [89], "cuda": "13.0"},
+                     {"source": "release", "version": "0.1.39", "archs": [120], "cuda": "13.0"}):
             with self.subTest(meta=meta):
-                def download(url, dst, what=None):
-                    with zipfile.ZipFile(dst, "w") as z:
-                        z.writestr("BUILD.json", json.dumps(meta))
-                        z.writestr(setup.EXE, b"engine")
-                    setup.mark(dst)
-
-                with mock.patch.object(setup.urllib.request, "urlopen", lambda req, timeout=None: Response()), \
-                        mock.patch.object(setup, "download", download):
-                    eng, _ = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
+                eng, _, _ = self.run_get([setup.PREBUILT_URL], meta)
                 self.assertIsNone(eng)
-                z = self.root / "engine" / setup.PREBUILT_ASSET
-                self.assertFalse(z.exists())
-                self.assertFalse(z.with_name(z.name + ".done").exists())
+                self.assertFalse((self.root / "engine" / setup.EXE).exists())
 
-    def test_an_installed_engine_is_kept(self):
+    def test_an_unverified_installed_engine_is_not_reused(self):
         (self.root / "engine" / "BUILD.json").write_text(json.dumps(
-            {"version": ".".join(map(str, setup.MIN_ENGINE)), "archs": [89]}))
+            {"version": "99.99.99", "archs": [89]}))
         (self.root / "engine" / setup.EXE).write_bytes(b"old")
-
-        def urlopen(req, timeout=None):
-            raise AssertionError("asked the network for an installed engine")
-
-        with mock.patch.object(setup.urllib.request, "urlopen", urlopen):
-            eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
-        self.assertEqual(eng, self.root / "engine")
+        eng, out = quiet(setup.get_prebuilt, "", {"arch": 89}, "gpu")
+        self.assertIsNone(eng)
         self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
 
 

@@ -255,7 +255,7 @@ class HipVision(unittest.TestCase):
             if vexe:
                 (eng / setup.VEXE).write_bytes(b"vision")
             src, vsrc = "S", "V"
-            (eng / "BUILD.json").write_text(json.dumps({"backend": "hip", "archs": ["gfx1201"], "src": src, **meta}))
+            (eng / "BUILD.json").write_text(json.dumps({"source": "local-hip", "backend": "hip", "archs": ["gfx1201"], "src": src, **meta}))
             built = []
 
             def cmake_build(src_dir, bdir, target, defs, vcvars, bat):

@@ -302,11 +302,14 @@ class WindowsDetection(unittest.TestCase):
         """get_prebuilt_hip: a published zip (here a local folder) is unpacked into engine/; one without code for the
         card, or older than the first Windows HIP release, is refused."""
         import json
+        import hashlib
         import zipfile
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             pub = root / "pub"
             pub.mkdir()
+
+            manifest = root / "trusted.json"
 
             def publish(meta):
                 with zipfile.ZipFile(pub / setup.WIN_HIP_ASSET, "w") as z:
@@ -314,10 +317,17 @@ class WindowsDetection(unittest.TestCase):
                     z.writestr("strata-device.exe", "probe")
                     z.writestr("rocm/bin/amdhip64_7.dll", "dll")
                     z.writestr("BUILD.json", json.dumps(meta))
+                archive = pub / setup.WIN_HIP_ASSET
+                manifest.write_text(json.dumps({"artifacts": {setup.WIN_HIP_ASSET: {
+                    "version": "0.1.39", "size": archive.stat().st_size,
+                    "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}}}))
             ver = ".".join(map(str, setup.WIN_HIP_MIN_ENGINE))
             good = {"source": "prebuilt", "backend": "hip", "version": ver, "archs": ["gfx1100", "gfx1201"],
                     "lib_dirs": ["rocm/bin"]}
-            with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "say", lambda *a, **k: None), \
+            with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "WIN", True), \
+                    mock.patch.object(setup, "EXE", "strata.exe"), \
+                    mock.patch.dict(setup.os.environ, {"STRATA_ARTIFACT_MANIFEST": str(manifest)}), \
+                    mock.patch.object(setup, "say", lambda *a, **k: None), \
                     mock.patch.object(setup, "ok", lambda *a: None), mock.patch.object(setup, "warn", lambda *a: None):
                 publish({**good, "archs": ["gfx1100"]})
                 self.assertIsNone(setup.get_prebuilt_hip(str(pub) + "/", {"arch": "gfx1201"}))
