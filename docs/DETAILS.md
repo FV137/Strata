@@ -910,7 +910,7 @@ you> /image C:\Users\me\Pictures\receipt.jpg
 you> What is the total on this receipt?
 ```
 
-**OpenAI API** (an `image_url` part: a `data:` URL, an `http(s)://` URL or a local file path):
+**OpenAI API** (an `image_url` part containing a base64 image `data:` URL):
 
 ```python
 import base64
@@ -923,10 +923,16 @@ r = client.chat.completions.create(model="strata", messages=[{"role": "user", "c
 print(r.choices[0].message.content)
 ```
 
-**Anthropic API:** an `image` block with a `base64` (or `url`) source, as usual.
+**Anthropic API:** an `image` block with a `base64` source. Chat apps with image upload and terminal `/image`
+continue to upload bytes from the client. Server-local paths and `file:` URLs are rejected.
 
-JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF work (the last ones are converted to PNG first; agents such as omp send
-WebP). Chat apps with image upload work the same way.
+JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF are validated with Pillow and converted to RGB PNG before the native
+encoder. Limits: 16 MiB per encoded/normalized image, 16 million pixels, 16,000 pixels per dimension, and
+16 images per request; the API request-body limit also applies. Only the first animation frame is used.
+
+Remote image URLs are disabled by default. Administrators can allow exact HTTPS origins through
+`vision.image_origins`; only public destinations are accepted, and redirects are rejected. See
+[image input security](IMAGE_INPUT_SECURITY.md) for configuration and the remaining limits.
 
 ### Speed with images on (4K context, measured)
 
