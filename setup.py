@@ -45,6 +45,7 @@ model files; it has not been generation-tested by this installer change.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -53,6 +54,8 @@ import os
 import platform
 import re
 import shutil
+import stat
+import tempfile
 import struct
 import subprocess
 import sys
@@ -104,13 +107,12 @@ HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
-# The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
-# by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
-# "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
-# With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
-# tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+# Reviewed release snapshot; never fall forward to latest. See docs/ENGINE_DOWNLOAD_SECURITY.md.
+PREBUILT_RELEASE = "v0.1.39"
+PREBUILT_URL = f"https://github.com/Niko1221/Strata/releases/download/{PREBUILT_RELEASE}/"
 PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
+ARTIFACT_MANIFEST = Path(__file__).resolve().parent / "engine-artifacts.json"
+ARTIFACT_MANIFEST_OVERRIDE = None
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
@@ -1057,6 +1059,269 @@ def free_gb(path):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
+class ArtifactError(ValueError):
+    """A downloaded archive or installed tree does not match the configured trust anchor."""
+
+
+def artifact_spec(asset, custom=False):
+    """Only a committed manifest, or a manifest explicitly supplied by the user, can authorize bytes."""
+    path = (ARTIFACT_MANIFEST_OVERRIDE or os.environ.get("STRATA_ARTIFACT_MANIFEST")) if custom else None
+    if custom and not path:
+        raise ArtifactError("custom --prebuilt requires --artifact-manifest (or STRATA_ARTIFACT_MANIFEST)")
+    try:
+        data = json.loads(Path(path or ARTIFACT_MANIFEST).read_text(encoding="utf-8"))
+        spec = data["artifacts"][asset]
+        if not isinstance(spec, dict) or type(spec.get("size")) is not int or not 0 < spec["size"] <= 1 << 30 or \
+                not re.fullmatch(r"[0-9a-f]{64}", str(spec.get("sha256", ""))):
+            raise ValueError("invalid size or SHA-256")
+        return spec
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ArtifactError(f"no trusted size/SHA-256 for {asset} in {path or ARTIFACT_MANIFEST}: {e}") from e
+
+
+def artifact_cache(asset, spec):
+    # Keep previous releases' archives: a failed update must not remove their integrity evidence.
+    return ROOT / ".cache" / "engine-artifacts" / spec["sha256"] / asset
+
+
+def stream_sha256(stream):
+    h = hashlib.sha256()
+    for block in iter(lambda: stream.read(1 << 20), b""):
+        h.update(block)
+    return h.hexdigest()
+
+
+def verify_artifact(path, spec):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != spec["size"]:
+        raise ArtifactError(f"{path.name}: archive size does not match the trusted manifest")
+    with path.open("rb") as f:
+        if stream_sha256(f) != spec["sha256"]:
+            raise ArtifactError(f"{path.name}: archive SHA-256 does not match the trusted manifest")
+
+
+def download_artifact(url, asset, spec):
+    """Bounded, non-resuming download. Re-hash cached bytes every time; .done has no authority here."""
+    dst = artifact_cache(asset, spec)
+    if dst.exists() or dst.is_symlink():
+        try:
+            verify_artifact(dst, spec)
+        except ArtifactError:
+            dst.unlink(missing_ok=True)
+            raise
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # A unique temporary file prevents overlapping setup runs from sharing partially written bytes.
+    with tempfile.NamedTemporaryFile(dir=dst.parent, prefix="download-", delete=False) as f:
+        partial = Path(f.name)
+        try:
+            if url.startswith(("http://", "https://")):
+                if not url.startswith("https://"):
+                    raise ArtifactError("engine/source downloads require HTTPS or an explicit local path")
+                source = urllib.request.urlopen(download_request(url), timeout=60)
+                if not source.geturl().startswith("https://"):
+                    source.close()
+                    raise ArtifactError("engine/source download redirected away from HTTPS")
+            else:
+                source = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path)
+                              if url.startswith("file://") else url).open("rb")
+            with source:
+                size = 0
+                while True:
+                    block = source.read(min(1 << 20, spec["size"] + 1 - size))
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > spec["size"]:
+                        raise ArtifactError(f"{asset}: download exceeds trusted size")
+                    f.write(block)
+            f.flush()
+            verify_artifact(partial, spec)
+            f.close()                                 # Windows cannot rename an open NamedTemporaryFile
+            partial.replace(dst)
+        finally:
+            f.close()
+            partial.unlink(missing_ok=True)
+    return dst
+
+
+def archive_path(name):
+    """Portable relative paths only, including Windows device names/ADS and case aliases."""
+    parts = name.rstrip("/").split("/")
+    if not name or name.startswith("/") or "\\" in name or any(
+            not p or p in (".", "..") or p[-1:] in (".", " ") or re.search(r'[<>:"|?*\x00-\x1f]', p) or
+            re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", p, re.I) for p in parts):
+        raise ArtifactError(f"unsafe archive path: {name!r}")
+    return "/".join(parts)
+
+
+def archive_members(z, *, source=False):
+    """Validate the entire directory before any entry is written, including skipped source UI files."""
+    members, names, total = [], {}, 0
+    infos = z.infolist()
+    if len(infos) > 100000:
+        raise ArtifactError("archive has too many entries")
+    limit = 512 << 20 if source else 8 << 30
+    for info in infos:
+        name = archive_path(info.orig_filename)
+        mode = stat.S_IFMT(info.external_attr >> 16)
+        if mode not in (0, stat.S_IFREG, stat.S_IFDIR) or info.flag_bits & 1:
+            raise ArtifactError(f"unsupported archive entry: {name}")
+        if (mode == stat.S_IFDIR and not info.is_dir()) or (mode == stat.S_IFREG and info.is_dir()):
+            raise ArtifactError(f"invalid archive directory: {name}")
+        if info.file_size < 0 or info.file_size > min(limit, 4 << 30) or \
+                (name == "BUILD.json" and info.file_size > 1 << 20):
+            raise ArtifactError("archive entry is too large")
+        total += info.file_size
+        if total > limit:
+            raise ArtifactError("archive expands beyond the size limit")
+        key = name.casefold()
+        if key in names:
+            raise ArtifactError(f"duplicate archive path: {name}")
+        names[key] = info.is_dir()
+        members.append((info, name))
+    for key in names:
+        parts = key.split("/")
+        if any(names.get("/".join(parts[:i])) is False for i in range(1, len(parts))):
+            raise ArtifactError(f"archive file is also a directory: {key}")
+    return members
+
+
+def artifact_files(z, *, source=False):
+    files = {}
+    prefix = f"llama.cpp-{LLAMA_CPP_COMMIT}/"
+    for info, name in archive_members(z, source=source):
+        if source:
+            if not (name + "/").startswith(prefix):
+                raise ArtifactError("source archive has an unexpected commit/root directory")
+            name = name[len(prefix):]
+            if name == "tools/ui" or name.startswith("tools/ui/"):
+                continue                              # Windows' path limit; this web UI is not built by Strata
+        if not source and name.casefold() == ".artifact.json":
+            raise ArtifactError("archive cannot supply setup's integrity receipt")
+        if not info.is_dir():
+            files[name] = info
+    return files
+
+
+def extract_artifact(z, dst, *, source=False):
+    files = artifact_files(z, source=source)
+    for name, info in files.items():
+        out = dst / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with z.open(info) as src, out.open("xb") as target:
+            shutil.copyfileobj(src, target, 1 << 20)
+        if out.stat().st_size != info.file_size:
+            raise ArtifactError(f"archive entry size mismatch: {name}")
+    return files
+
+
+def tree_matches_archive(folder, z, *, source=False, hip=False):
+    if folder.is_symlink() or not folder.is_dir():
+        return False
+    files = artifact_files(z, source=source)
+    # HIP's bundled runtime is also placed beside the executable, as on a fresh verified installation.
+    if hip:
+        for name, info in list(files.items()):
+            if name.startswith("rocm/bin/") and any(Path(name).match(p) for p in HIP_RUNTIME_DLLS):
+                files.setdefault(Path(name).name, info)
+    actual = set()
+    for path in folder.rglob("*"):
+        if path.is_symlink():
+            return False
+        if not path.is_file():
+            continue
+        name = path.relative_to(folder).as_posix()
+        if name == ".artifact.json" and not source:
+            continue                                  # merely identifies the manifest/zip, never authorizes it
+        actual.add(name)
+    if actual != set(files):
+        return False
+    for name, info in files.items():
+        path = folder / name
+        if path.stat().st_size != info.file_size:
+            return False
+        with path.open("rb") as f, z.open(info) as original:
+            if stream_sha256(f) != stream_sha256(original):
+                return False
+    return True
+
+
+def replace_artifact_tree(staged, target):
+    """Swap complete directories, restoring the old one if activation fails (including Windows locks)."""
+    backup = target.with_name(target.name + ".previous")
+    if backup.exists():
+        raise ArtifactError(f"{backup} exists from an interrupted update; restore or move it before retrying")
+    had_old = target.exists()
+    if had_old:
+        target.replace(backup)
+    try:
+        staged.replace(target)
+    except BaseException:
+        if had_old:
+            backup.replace(target)
+        raise
+    if had_old:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def read_engine_meta(eng):
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def is_local_engine(meta):
+    return meta.get("source") in ("local", "local-hip")
+
+
+@contextlib.contextmanager
+def local_build_tree(target, source):
+    """Never carry downloaded executables or libraries into a directory granted local-build trust."""
+    if read_engine_meta(target).get("source") == source:
+        yield target  # Existing local compilation inputs/outputs remain a separate trusted boundary.
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="_local-engine-", dir=target.parent) as staging:
+        staged = Path(staging) / "engine"
+        staged.mkdir()
+        yield staged
+        replace_artifact_tree(staged, target)
+
+
+def installed_prebuilt_verified(eng):
+    """Re-derive every expected file from a hashed archive; no mutable receipt or BUILD.json is proof."""
+    try:
+        receipt = json.loads((eng / ".artifact.json").read_text(encoding="utf-8"))
+        asset = archive_path(receipt["asset"])
+        if "/" in asset:
+            return False
+        spec = artifact_spec(asset, custom=bool(receipt.get("custom")))
+        if receipt.get("sha256") != spec["sha256"]:
+            return False
+        archive = artifact_cache(asset, spec)
+        verify_artifact(archive, spec)
+        with zipfile.ZipFile(archive) as z:
+            return tree_matches_archive(eng, z, hip=asset == WIN_HIP_ASSET)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, RuntimeError):
+        return False
+
+
+def require_verified_engine(exe):
+    eng = Path(exe).parent
+    meta = read_engine_meta(eng)
+    if is_local_engine(meta):
+        return                                        # user-controlled local builds are a separate trust boundary
+    if eng.resolve() not in (engine_dir(13).resolve(), engine_dir(12).resolve()) and \
+            meta.get("source") != "prebuilt":
+        return                                        # an explicitly configured external local executable
+    if not installed_prebuilt_verified(eng):
+        fail("the installed ready-made engine has not passed integrity verification",
+             "run setup again to install the pinned verified engine, or compile it locally with --build; "
+             "the previous files have been preserved")
+
+
 def drop_archive(z: Path) -> None:
     """An unpacked or refused engine archive and its .done mark go: a refused one kept them, and every later run
     reused it ("already downloaded") instead of the published one (PR #324)."""
@@ -1327,36 +1592,30 @@ def check_shards(shards):
 
 
 def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
-    llama = ROOT / "third_party" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+    """Pinned, verified source; legacy source folders are replaced only after a complete verified extraction."""
+    try:
+        llama = ROOT / "third_party" / "llama.cpp"
+        asset = f"llama.cpp-{LLAMA_CPP_COMMIT}.zip"
+        spec = artifact_spec(asset)
+        if spec.get("commit") != LLAMA_CPP_COMMIT:
+            raise ArtifactError("source manifest does not match LLAMA_CPP_COMMIT")
+        archive = download_artifact(LLAMA_CPP_ZIP, asset, spec)
+        with zipfile.ZipFile(archive) as z:
+            if tree_matches_archive(llama, z, source=True):
+                return llama
+            llama.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="_source-", dir=llama.parent) as staging:
+                staged = Path(staging) / "llama.cpp"
+                staged.mkdir()
+                extract_artifact(z, staged, source=True)
+                if not (staged / "ggml" / "CMakeLists.txt").is_file() or not (staged / "gguf-py").is_dir():
+                    raise ArtifactError("source archive lacks ggml or gguf-py")
+                replace_artifact_tree(staged, llama)
         return llama
-    z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
-    download(LLAMA_CPP_ZIP, z, "llama.cpp source")
-    tmp = ROOT / "third_party" / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
-        # folder like Downloads\Strata-main\Strata-main (#206)
-        f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
-    top = next(tmp.iterdir())
-    shutil.rmtree(llama, ignore_errors=True)
-    # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
-    # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
-    # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
-    for attempt in range(5):
-        try:
-            shutil.move(str(top), str(llama))
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
-            time.sleep(2)
-    shutil.rmtree(tmp, ignore_errors=True)
-    z.unlink(missing_ok=True)
-    z.with_name(z.name + ".done").unlink(missing_ok=True)
-    return llama
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as e:
+        fail(f"could not verify the pinned llama.cpp source ({e})",
+             "check the connection and committed engine-artifacts.json, then rerun setup; "
+             "existing source files were preserved")
 
 
 def req_name(line: str) -> str:
@@ -1660,6 +1919,8 @@ def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict
             hip_engine = False
         if not probe.exists() or not hip_engine:
             return None
+        if not is_local_engine(read_engine_meta(probe.parent)) and not installed_prebuilt_verified(probe.parent):
+            return None                                # discovery must not execute a legacy/unverified download
         try:
             hip_runtime_beside_exe(probe.parent)       # #468 #461: not the driver's System32 copy
             env = dict(os.environ)                     # the ready-made engine's ROCm DLLs (rocm/bin beside it)
@@ -1757,72 +2018,8 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
 
 
 def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
-    """The ready-made Windows HIP engine (WIN_HIP_ASSET) in engine/, kept between runs; None when it cannot be had
-    (not published for this version, no internet) or has no code for the card."""
-    eng = ROOT / "engine"
-    info = eng / "BUILD.json"
-    if info.exists() and (eng / EXE).exists():
-        try:
-            meta = json.loads(info.read_text())
-        except ValueError:
-            meta = {}
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("backend") == "hip" and meta.get("source") == "prebuilt" and ver >= WIN_HIP_MIN_ENGINE and \
-                gpu["arch"] in meta.get("archs", []) and not updating:
-            ok("ready-made AMD engine already installed")
-            return eng
-    if not url_base:
-        return None
-    eng.mkdir(exist_ok=True)
-    z = eng / WIN_HIP_ASSET
-    bases = prebuilt_bases(url_base)
-    for i, base in enumerate(bases):
-        if not base.startswith(("http://", "https://")):
-            break
-        try:
-            req = urllib.request.Request(base + WIN_HIP_ASSET, method="HEAD", headers={"User-Agent": "strata-setup"})
-            urllib.request.urlopen(req, timeout=60).close()
-            break
-        except OSError as e:
-            if i + 1 < len(bases):
-                say(f"  No ready-made AMD engine for v{source_version()} ({e}): the latest release instead")
-                continue
-            warn(f"no ready-made AMD engine at {base} ({e})")
-            return None
-    say("  Downloading the ready-made Strata engine for AMD GPUs (with the ROCm libraries it uses) ...")
-    download(base + WIN_HIP_ASSET, z, "Strata AMD engine")
-    tmp = eng / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
-    try:
-        meta = json.loads((tmp / "BUILD.json").read_text())
-    except (OSError, ValueError):
-        meta = {}
-    ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-    why = None
-    if meta.get("backend") != "hip" or not (tmp / EXE).exists():
-        why = "it is not a HIP engine"
-    elif ver < WIN_HIP_MIN_ENGINE:
-        why = f"it is version {meta.get('version')}; this setup needs {'.'.join(map(str, WIN_HIP_MIN_ENGINE))}"
-    elif gpu["arch"] not in meta.get("archs", []):
-        why = f"it is built for {', '.join(meta.get('archs', []))}; your GPU is {gpu['arch']}"
-    if why:
-        warn(f"the ready-made AMD engine at {base} cannot be used: {why}")
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        return None
-    for p in tmp.iterdir():
-        dst = eng / p.name
-        if dst.exists():
-            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        p.replace(dst)
-    shutil.rmtree(tmp, ignore_errors=True)
-    drop_archive(z)
-    hip_runtime_beside_exe(eng)                        # #468 #461
-    ok(f"ready-made AMD engine {meta.get('version', '')} for {', '.join(meta.get('archs', []))} "
-       f"(ROCm {meta.get('rocm', '?')})")
-    return eng
+    """Install only a complete, verified Windows HIP archive."""
+    return install_prebuilt(url_base, gpu, "none", updating=updating, hip=True)
 
 
 def rocm_version(root):
@@ -1928,7 +2125,13 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
     gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
     (#304): the image encoder too, for the CPU (there is no HIP encoder build yet)."""
-    eng = ROOT / "engine"
+    target = ROOT / "engine"
+    with local_build_tree(target, "local-hip") as eng:
+        _build_engine_hip(gpu, llama, vision, eng)
+    return target
+
+
+def _build_engine_hip(gpu, llama, vision, eng):
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
@@ -2010,105 +2213,104 @@ def driver_major(gpu):
 
 
 def prebuilt_bases(url_base) -> list[str]:
-    """Where to look for the ready-made engine, in order (each ending in a slash).  The default: the release of this
-    checkout's version first, then the latest (#214); an explicit --prebuilt / STRATA_PREBUILT_URL: only that."""
-    base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
-    if base != PREBUILT_URL:
-        return [base]
-    return [PREBUILT_TAG_URL.format(version=source_version()), base]
+    """One pinned default or one explicit override; no latest-release fallback."""
+    return [url_base if url_base.endswith(("/", "\\")) else url_base + "/"]
+
+
+def validate_prebuilt(eng, gpu, vision, spec, toolkit=13, hip=False):
+    meta = read_engine_meta(eng)
+    version = str(meta.get("version", ""))
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version) or version != spec.get("version") or \
+            tuple(map(int, version.split("."))) < (WIN_HIP_MIN_ENGINE if hip else MIN_ENGINE):
+        raise ArtifactError("BUILD.json version does not match a compatible trusted release")
+    if meta.get("source") not in ("prebuilt", "release"):
+        raise ArtifactError("archive is not a ready-made engine")
+    if (meta.get("backend") == "hip") != hip or meta.get("backend", "cuda") not in ("cuda", "hip"):
+        raise ArtifactError("archive has the wrong engine backend")
+    archs = meta.get("archs")
+    if not isinstance(archs, list) or not archs or type(meta.get("ptx", False)) is not bool:
+        raise ArtifactError("BUILD.json has no valid GPU architectures")
+    if hip:
+        if any(not isinstance(a, str) or not re.fullmatch(r"gfx[0-9a-f]+", a) for a in archs) or \
+                any(a not in archs for a in gpu.get("archs", [gpu["arch"]])):
+            raise ArtifactError("ready-made HIP engine does not support the selected GPU")
+    else:
+        if any(type(a) is not int or a <= 0 for a in archs) or any(
+                int(a) not in archs and not (meta.get("ptx") and int(a) > max(archs))
+                for a in gpu.get("archs", [gpu["arch"]])):
+            raise ArtifactError("ready-made CUDA engine does not support the selected GPU")
+        if str(meta.get("cuda", "")).split(".")[0] != str(toolkit):
+            raise ArtifactError("ready-made CUDA engine uses a different toolkit")
+    for key in ("lib_dirs", "cuda_dirs"):
+        dirs = meta.get(key, [])
+        if not isinstance(dirs, list) or any(not isinstance(d, str) for d in dirs):
+            raise ArtifactError(f"invalid {key} in BUILD.json")
+        for d in dirs:
+            archive_path(d)
+            if not (eng / d).is_dir():
+                raise ArtifactError(f"missing library directory: {d}")
+    required = [EXE] + ([VEXE] if vision != "none" else [])
+    if hip:
+        required.append("strata-device.exe" if WIN else "strata-device")
+    if any(not (eng / name).is_file() or (eng / name).stat().st_size == 0 for name in required):
+        raise ArtifactError("ready-made archive is missing a required engine executable")
+    return meta
+
+
+def install_prebuilt(url_base, gpu, vision, *, updating=False, toolkit=13, hip=False):
+    eng = ROOT / "engine" if hip else engine_dir(toolkit)
+    asset = WIN_HIP_ASSET if hip else CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
+    # Local compilation remains supported. A downloaded BUILD.json cannot select this path at installation.
+    if is_local_engine(read_engine_meta(eng)):
+        return None
+    custom = bool(url_base) and prebuilt_bases(url_base)[0] != PREBUILT_URL
+    try:
+        if installed_prebuilt_verified(eng) and not updating:
+            receipt = json.loads((eng / ".artifact.json").read_text())
+            spec = artifact_spec(receipt["asset"], custom=bool(receipt.get("custom")))
+            if receipt["asset"] == asset:
+                validate_prebuilt(eng, gpu, vision, spec, toolkit, hip)
+                ok("verified ready-made engine already installed")
+                return eng
+        if not url_base:
+            return None
+        # No Linux assets were published for the reviewed release. Its normal path compiles verified source.
+        if not WIN and not custom:
+            return None
+        spec = artifact_spec(asset, custom=custom)
+        base = prebuilt_bases(url_base)[0]
+        say("  Downloading the pinned, verified Strata engine ...")
+        archive = download_artifact(base + asset, asset, spec)
+        eng.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="_engine-", dir=eng.parent) as staging:
+            staged = Path(staging) / "engine"
+            staged.mkdir()
+            with zipfile.ZipFile(archive) as z:
+                extract_artifact(z, staged)
+            meta = validate_prebuilt(staged, gpu, vision, spec, toolkit, hip)
+            if hip:
+                hip_runtime_beside_exe(staged)
+            if not WIN:
+                for name in (EXE, VEXE, "strata-device"):
+                    if (staged / name).exists():
+                        (staged / name).chmod(0o755)
+            (staged / ".artifact.json").write_text(json.dumps({"asset": asset, "sha256": spec["sha256"],
+                                                              "custom": custom}), encoding="utf-8")
+            replace_artifact_tree(staged, eng)
+        ok(f"verified ready-made engine {meta['version']} installed")
+        return eng
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, RuntimeError) as e:
+        warn(f"ready-made engine was not activated ({e}); previous engine files were preserved")
+        return None
 
 
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
-    """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
-    updating: called to replace an installed engine, which starts instead when this fails (no compile).
-    toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
-    eng = engine_dir(toolkit)
-    asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
-    info = eng / "BUILD.json"
-    if info.exists() and (eng / EXE).exists() and json.loads(info.read_text()).get("backend") != "hip":
-        meta = json.loads(info.read_text())
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("source") == "local":              # compiled here: build_engine checks its source and cards
-            return None
-        have = [int(a) for a in meta.get("archs", [])]
-        miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
-                if have and int(x) not in have and not (meta.get("ptx") and int(x) > max(have))]
-        if miss:                                       # a card it has no code for (#128): compiled here instead
-            warn(f"the installed engine is built for {', '.join(str(a) for a in have)}; your GPU is "
-                 f"{', '.join(str(x) for x in miss)}: compiling instead")
-            return None
-        if ver >= MIN_ENGINE:
-            ok("ready-made engine already installed")
-            return eng
-        say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
-        info.unlink()
-    if not url_base:
-        return None
-    eng.mkdir(exist_ok=True)
-    z = eng / asset
-    bases = prebuilt_bases(url_base)
-    for i, base in enumerate(bases):
-        if not base.startswith(("http://", "https://")):
-            break
-        try:                                           # not published (yet), or no internet: compile instead
-            req = urllib.request.Request(base + asset, method="HEAD", headers={"User-Agent": "strata-setup"})
-            urllib.request.urlopen(req, timeout=60).close()
-            break
-        except OSError as e:
-            if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
-                say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
-                continue
-            warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
-            return None
-    say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
-    download(base + asset, z, "Strata engine")
-    tmp = eng / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
-    meta = json.loads((tmp / "BUILD.json").read_text())
-    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit()) < MIN_ENGINE:
-        need = ".".join(map(str, MIN_ENGINE))
-        if updating:                                   # these files are newer than the published release (#58)
-            warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
-                 f"in a few minutes to update it")
-        else:
-            warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
-                 f"{need}: compiling instead")
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        return None
-    archs = [int(a) for a in meta.get("archs", [])]
-    miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
-            if int(x) not in archs and not (meta.get("ptx") and int(x) > max(archs))]
-    if miss:
-        warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is "
-             f"{', '.join(str(x) for x in miss)}" + ("" if updating else ": compiling instead"))
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        return None
-    for p in tmp.iterdir():
-        dst = eng / p.name
-        if dst.exists():
-            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        p.replace(dst)
-    shutil.rmtree(tmp, ignore_errors=True)
-    drop_archive(z)
-    if not (eng / EXE).exists():
-        fail("the ready-made engine archive has no " + EXE)
-    if not WIN:
-        for x in (EXE, VEXE):
-            if (eng / x).exists():
-                (eng / x).chmod(0o755)
-    ok(f"ready-made engine {meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
-       f"{meta.get('cuda', '?')})")
-    return eng
+    return install_prebuilt(url_base, gpu, vision, updating=updating, toolkit=toolkit)
 
 
 def update_installed_engine(url_base, toolkit=None) -> None:
-    """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
-    START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
-    still running, no ready-made engine for this GPU) the installed engine is kept and starts as before.
+    """Verify installed downloads before use; replace legacy/old builds from the pinned release.
+    Failed updates preserve files, but only a previously verified engine or a local build may still start.
     toolkit None: engine/, then the experimental CUDA 12 engine in engine-cuda12/ when one is installed."""
     if toolkit is None:
         update_installed_engine(url_base, 13)
@@ -2119,11 +2321,11 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     info = eng / "BUILD.json"
     if not info.exists() or not (eng / EXE).exists():
         return
-    meta_text = info.read_text()
-    meta = json.loads(meta_text)
+    meta = read_engine_meta(eng)
+    verified = installed_prebuilt_verified(eng) if not is_local_engine(meta) else False
     if meta.get("backend") == "hip" and WIN:           # AMD on Windows: the ready-made HIP engine, when older
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("source") == "prebuilt" and ver < WIN_HIP_MIN_ENGINE:
+        if not is_local_engine(meta) and (not verified or ver < WIN_HIP_MIN_ENGINE):
             try:
                 g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
                 if g is None:
@@ -2134,7 +2336,9 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                     raise RuntimeError("not published yet")
             except (Exception, SystemExit) as e:
                 warn(f"could not update the AMD engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
-                     "starting the installed one")
+                     "the previous files were preserved")
+            if not verified:
+                require_verified_engine(eng / EXE)
         return
     if meta.get("backend") == "hip":                   # AMD: compiled here, again when its source changed
         if meta.get("src") != source_hash(ENGINE_SOURCES):
@@ -2151,13 +2355,13 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                      "starting the installed one")
         return
     ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-    local = meta.get("source") == "local"
+    local = is_local_engine(meta)
     vision = meta.get("vision") or "none"
     if local:                                          # compiled here: is it older than the source (a git pull)?
         if meta.get("src") == source_hash(ENGINE_SOURCES) and \
                 (vision == "none" or meta.get("vision_src") == source_hash(VISION_SOURCES)):
             return
-    elif ver >= MIN_ENGINE:
+    elif verified and ver >= MIN_ENGINE:
         return
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         for x in (EXE, VEXE):
@@ -2189,9 +2393,9 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         except Exception as e:                         # a failed download must not stop the model from starting
             warn(f"updating the engine failed ({e})")
     if new is None:
-        if not info.exists():
-            info.write_text(meta_text)                 # get_prebuilt drops it before downloading: put it back
-        warn(f"could not update the engine: starting the installed {meta.get('version')}")
+        if not verified:
+            require_verified_engine(eng / EXE)
+        warn(f"could not update the engine: starting the verified installed {meta.get('version')}")
         return
     pip_cuda_libs(toolkit)
 
@@ -2353,13 +2557,19 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     engine-cuda12/ with its own build folders."""
     if toolkit is None:
         toolkit = 12 if min(int(x) for x in gpu.get("archs", [gpu["arch"]])) < CUDA13_MIN_ARCH else 13
+    target = engine_dir(toolkit)
+    with local_build_tree(target, "local") as eng:
+        _build_engine(gpu, vision, yes, llama, toolkit, eng)
+    return target
+
+
+def _build_engine(gpu, vision, yes, llama, toolkit, eng):
     t12 = int(toolkit) == 12
-    eng = engine_dir(toolkit)
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
     want_vision = vision != "none"
-    local = meta.get("source") == "local"
+    local = is_local_engine(meta)
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
     archs = sorted({int(x) for x in gpu.get("archs", [gpu["arch"]])})    # every card the model runs on
     built = {int(x) for x in meta.get("archs", [])}
@@ -2369,7 +2579,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
         (meta.get("isa_floor") or "") == floor
-    vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
+    vision_ok = not want_vision or (local and (eng / VEXE).exists() and meta.get("vision_src") == vsrc)
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
@@ -3017,6 +3227,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     sys.path.insert(0, str(ROOT / "tools"))
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    require_verified_engine(cfg["exe"])
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads). It takes about 5-10 minutes; the PC is busy meanwhile.")
@@ -3146,6 +3357,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    require_verified_engine(cfg["exe"])
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -3670,6 +3882,9 @@ def main() -> int:
                          "Volta). 12 also runs with an older driver (Windows 528+, Linux 525+). docs/OLDER_GPUS.md")
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
+    ap.add_argument("--artifact-manifest", default=None,
+                    help="trusted local size/SHA-256 JSON for an explicit --prebuilt override; "
+                         "also STRATA_ARTIFACT_MANIFEST (docs/ENGINE_DOWNLOAD_SECURITY.md)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
@@ -3701,6 +3916,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    global ARTIFACT_MANIFEST_OVERRIDE
+    ARTIFACT_MANIFEST_OVERRIDE = a.artifact_manifest
     if a.backend == "sycl":                            # Intel Arc: the SYCL port's own setup (sycl/setup_intel.py)
         return sycl_setup(sys.argv[1:])
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:

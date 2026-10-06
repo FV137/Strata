@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
-import base64
 import hashlib
 import hmac
 import codecs
@@ -41,7 +40,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -57,7 +55,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve import runconfig  # noqa: E402
+from serve import image_input, runconfig  # noqa: E402
 from serve.access import api_key_of, require_key_for_bind  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -1269,6 +1267,7 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
+        self.image_origins = image_input.image_origins_of(cfg.get("image_origins"))
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
         if cfg.get("gpu"):
             args.append("--gpu")
@@ -1310,49 +1309,16 @@ class Vision:
         self._start()
 
     @staticmethod
-    def load(source: str) -> bytes:
-        if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
-        if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "strata"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
-        path = source[7:] if source.startswith("file://") else source
-        if path and os.path.isfile(path):
-            return Path(path).read_bytes()
-        raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
+    def load(source: str, image_origins=()) -> bytes:
+        return image_input.load(source, image_origins)
 
     @staticmethod
     def normalize(data: bytes) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG."""
-        if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
-                data[:6] in (b"GIF87a", b"GIF89a"):
-            return data
-        try:
-            import io
-            from PIL import Image
-        except ImportError:
-            raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
-                             "GIF work without it") from None
-        try:
-            im = Image.open(io.BytesIO(data))
-            im.load()
-        except Exception as e:
-            raise ValueError(f"the image could not be read ({e})") from None
-        if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
-            im = im.convert("RGBA")
-            bg = Image.new("RGB", im.size, (255, 255, 255))   # transparent areas become white, not black
-            bg.paste(im, mask=im.split()[-1])
-            im = bg
-        elif im.mode != "RGB":
-            im = im.convert("RGB")
-        out = io.BytesIO()
-        im.save(out, format="PNG")
-        return out.getvalue()
+        return image_input.normalize(data)
 
     def encode(self, source: str) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
+        data = self.normalize(self.load(source, self.image_origins))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
@@ -2149,9 +2115,11 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        images = images_of(messages)
+        if len(images) > image_input.MAX_IMAGES:
+            raise ValueError(f"at most {image_input.MAX_IMAGES} images are accepted per request")
         ids = self.encode_prompt(messages, tools, kwargs)
         self.embeddings.path = None
-        images = images_of(messages)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "

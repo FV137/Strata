@@ -38,7 +38,17 @@ necessary because the container network is a separate exposure. Environment keys
 recreating a container; they are not newly written into the model config by the entry point. A saved config key
 still works when neither environment alias is supplied and is preserved through `REINSTALL=1`.
 
-## Remaining work, in priority order
+## Image boundary follow-up
+
+This branch addresses the image-source finding from the initial review below. Images upload as bounded base64
+bytes by default; requests cannot read server-local paths. Optional remote images require an exact HTTPS origin
+allowlist, public-only DNS results and a connection pinned to a checked address. Redirects are rejected, TLS keeps
+the original hostname, and byte/deadline/pixel/count checks run before native encoding. See
+[image input security](IMAGE_INPUT_SECURITY.md) for configuration, tests and remaining codec/concurrency limits.
+
+## Initial remaining work, in priority order
+
+The following table records the initial review baseline; the image-source row is addressed by the follow-up above.
 
 | Priority and boundary | Evidence / practical consequence | Next change |
 | --- | --- | --- |
