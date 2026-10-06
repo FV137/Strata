@@ -20,7 +20,7 @@ What the first run does (each step is skipped when it is already done):
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
-Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
+Options: --family qwen|swift|coder|unsloth|orca, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|Q4_K_M, --context 32768, --rope-scaling none|linear|yarn
 (--rope-scale F; past the trained 262144 the setup adds yarn and the factor is the final context over 262144,
 at least 1 - an explicit --rope-scaling none is refused for such a context), --vision yes|no|gpu|cpu, --port
 8080, --yes (recommended
@@ -35,6 +35,12 @@ Setup recommends, it never forces: the recommended answers are the defaults (--y
 than it recommends - a longer context, more GPUs, a bigger RAM budget, a size it thinks will not fit - is kept, with
 what it risks.  With --yes, an explicit flag (--model, --gpus, ...) is the consent to a risk setup would otherwise
 stop at; --yes alone is not.
+
+OrcaRouter Q4_K_M: --family orca --model Q4_K_M (experimental, ~119.2 GB in three shards).
+Accept the Hugging Face repository's access terms, then set HF_TOKEN locally for downloads, or use
+--gguf-dir with the three original filenames. The token is used only for this repository over HTTPS,
+is not forwarded to redirects, and is never written to a run config. This option pins and verifies the
+model files; it has not been generation-tested by this installer change.
 """
 from __future__ import annotations
 
@@ -53,6 +59,7 @@ import sys
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -67,10 +74,12 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF": "e43d00f4e2b8b40b89f75e9adeb1045ac34c8acc",     # 2026-10-02
 }
 
 
 HF_DEFAULT = "https://huggingface.co"
+ORCA_REPO = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"
 
 
 def hf_endpoint() -> str:
@@ -86,6 +95,8 @@ def hf(repo: str) -> str:
 
 def hf_unpinned(url: str) -> str:
     """The same file at the repository's current revision (main)."""
+    if urllib.parse.urlsplit(url).path.startswith(f"/{ORCA_REPO}/resolve/"):
+        return url                                    # Orca's reviewed snapshot must never float to main
     return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1main/", url, count=1)
 
 
@@ -149,6 +160,18 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
+    # The shard total is a conservative upper bound for the expert arena, NOT a measured RAM requirement.
+    # Use the existing RAM-budget path; the engine sizes its actual experts from the GGUF tensor directories.
+    "Q4_K_M": {"about": "OrcaRouter Uncensored, EXPERIMENTAL: ~119.2 GB download; a RAM budget of experts, "
+                       "the remainder read from the SSD; throughput and quality not measured here",
+               "download_gb": 119.2, "ram_gb": 48, "arena_gb": 119.2, "families": ("orca",),
+               "budget": True, "nvidia_only": True, "experimental": True, "engine": (0, 1, 38),
+               "experimental_note": "OrcaRouter Q4_K_M is EXPERIMENTAL. Engine 0.1.38 added its Q5_0 expert "
+                                    "support (#473). This installer integration has not been generation-tested. "
+                                    "RAM planning uses the full shard size as a conservative arena upper bound; "
+                                    "48 GB is the inherited budget-mode planning threshold, not a measured minimum. "
+                                    "The original Qwen draft head is verified by the Orca target; acceptance and "
+                                    "speed need measurement on your hardware."},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -170,6 +193,15 @@ UNSLOTH_IQ4_XS_SHARDS = {
         (49835229856, "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7"),
     "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
         (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
+}
+# Sizes and LFS SHA-256 values from the OrcaRouter Hub snapshot above (2026-10-05).
+ORCA_Q4_K_M_SHARDS = {
+    "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00001-of-00003.gguf":
+        (44598509600, "fa6b8ea03042a47575c039b84af57e0169e0f1ceab539ab9edba08937bb237ef"),
+    "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00002-of-00003.gguf":
+        (44693535520, "6fb88b39f4b6e15d8acac6172faf65fcc2503703375440eb71d557161ed20df8"),
+    "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00003-of-00003.gguf":
+        (29858677824, "f2fc849eb4c14ac58253cc326f057b2f606f394004c1172e6c61c56dd0b0a075"),
 }
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
@@ -214,6 +246,15 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
+    "orca": {"title": "Qwen3.8-Flash-Next Uncensored (OrcaRouter)", "by": "OrcaRouter",
+             "about": "Q4_K_M, experimental; ~119.2 GB; gated download: accept access terms and set HF_TOKEN",
+             "hf": hf(ORCA_REPO), "file": "Qwen3.8-Flash-Next-Uncensored-{q}-0000{i}-of-00003.gguf",
+             "shards": 3, "strict_shards": True, "tag": "orca-", "mmproj_hf": hf(ORCA_REPO),
+             "mmproj": "mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf",
+             "name": "orcarouter-qwen3.8-flash-next-uncensored", "pack_args": ["--compat-bf16"],
+             "sha256": {**ORCA_Q4_K_M_SHARDS,
+                        "mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf":
+                            (907543296, "f0f352a97a62a057f3aecdb597cac664762cea2ca23f7b16ec92eee28c5572d9")}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -1023,6 +1064,32 @@ def drop_archive(z: Path) -> None:
     z.with_name(z.name + ".done").unlink(missing_ok=True)
 
 
+def download_request(url: str, method="GET", headers=None):
+    """Authenticate only the gated Orca repo; urllib does not copy unredirected headers to CDN redirects."""
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": "strata-setup", **(headers or {})})
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https" and parsed.netloc == "huggingface.co" and \
+            parsed.path.startswith(f"/{ORCA_REPO}/resolve/"):
+        token = os.environ.get("HF_TOKEN", "").strip()
+        if token:
+            req.add_unredirected_header("Authorization", f"Bearer {token}")
+    return req
+
+
+def orca_download_error(url: str, error) -> None:
+    """A gate or missing pinned file needs user action, not repeated downloads or a different revision."""
+    if not isinstance(error, urllib.error.HTTPError) or \
+            not urllib.parse.urlsplit(url).path.startswith(f"/{ORCA_REPO}/resolve/"):
+        return
+    if error.code in (401, 403):
+        fail("OrcaRouter download requires Hugging Face access",
+             f"accept access at https://huggingface.co/{ORCA_REPO} and set HF_TOKEN locally (sent only to "
+             "https://huggingface.co, never to mirrors or redirects), or pass --gguf-dir with the three original shards")
+    if error.code == 404:
+        fail("the pinned OrcaRouter file is unavailable; refusing to switch to main",
+             "check the repository access and pinned revision, or use --gguf-dir with the pinned original shards")
+
+
 def download(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
@@ -1042,10 +1109,11 @@ def download(url, dst: Path, what=None):
     total = 0
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = download_request(url, method="HEAD")
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except urllib.error.HTTPError as e:
+            orca_download_error(url, e)
             if e.code == 404 and hf_unpinned(url) != url:  # #214: the pinned revision is gone from the repository
                 warn(f"{what or dst.name}: not at the pinned revision any more; downloading the repository's "
                      "current file")
@@ -1065,7 +1133,7 @@ def download(url, dst: Path, what=None):
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
+            req = download_request(url, headers={"Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
                 if have and r.status != 206:                     # the server ignored the range: start over
                     f.seek(0)
@@ -1087,6 +1155,7 @@ def download(url, dst: Path, what=None):
             if not total or have >= total:
                 break
         except OSError as e:
+            orca_download_error(url, e)
             print()
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
@@ -1118,6 +1187,8 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
     engine and tools/iq_pack.py do.  The published name first; else the one first shard in the folder whose name has
     the size in it (an upload split or named differently: -00001-of-00003, Unsloth's ...-00001-of-00004.gguf).  A
     missing shard is check_shards' error later, as before."""
+    if fam.get("strict_shards"):
+        return [folder / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
     first = folder / model_file(fam, model, 1)
     if not first.exists():
         found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
@@ -1137,7 +1208,8 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL and UD-IQ4_XS only: other GGUFs (Unsloth's "
+                   "1.5's; the Coder's IQ1_M), Unsloth's UD-Q4_K_XL and UD-IQ4_XS, and the experimental "
+                   "OrcaRouter Uncensored Q4_K_M: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
                    "UD-Q2_K_XL, K-quants) cannot be used")
 
@@ -1145,6 +1217,9 @@ SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next 
 def gguf_unsupported(name: str) -> str | None:
     """#444: the quantization a GGUF's name says, when it is one Strata cannot run (not a setup size); else None."""
     m = GGUF_QUANT.search(name)
+    if m and m.group(1).upper() == "Q4_K_M" and name not in ORCA_Q4_K_M_SHARDS and \
+            not name.lower().startswith("mmproj"):
+        return m.group(1)                             # only the pinned Orca files, not arbitrary Q4_K_M models
     return m.group(1) if m and m.group(1).upper() not in MODELS and not name.lower().startswith("mmproj") else None
 
 
@@ -2450,7 +2525,9 @@ def unsloth_together(a, model, ram, gpu, chosen) -> bool:
         warn(f"--resident-budget-gib has no layer split: {model} runs on one GPU with it - using {gpu_name(gpu)} only "
              f"(leave the budget out to use {names} together)")
         return False
-    note = (f"no RAM budget - all of its experts (~{MODELS[model]['arena_gb']:.0f} GB) are loaded into RAM from the "
+    arena = (f"up to {MODELS[model]['arena_gb']:.0f} GB, conservative bound" if model == "Q4_K_M" else
+             f"~{MODELS[model]['arena_gb']:.0f} GB")
+    note = (f"no RAM budget - all of its experts ({arena}) are loaded into RAM from the "
             f"model files at start, and the files pass through the OS file cache (needs ~{need:.0f} GB of RAM, this "
             f"PC has {ram:.0f})")
     if a.gpus:
@@ -2460,9 +2537,10 @@ def unsloth_together(a, model, ram, gpu, chosen) -> bool:
         say()
         say(f"  {model} can run on one GPU with a RAM budget of its experts, or on {names} together without one:")
         say(f"  1) {gpu_name(gpu)} only: the most-used experts kept in RAM, the rest read from the SSD   (recommended: "
-            "the tested setup)")
+            + ("conservative starting point)" if model == "Q4_K_M" else "the tested setup)"))
         say(f"  2) {names} together: {note};")
-        say("     about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s)")
+        say("     Orca Q4_K_M multi-GPU performance has not been measured here" if model == "Q4_K_M" else
+            "     about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s)")
         if ask(f"{model}: which GPUs?", ["1", "2"], "1", a.yes) == "2":
             ok(f"{model} on {names}: {note}")
             return True
@@ -3532,7 +3610,8 @@ def sycl_setup(argv) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=list(FAMILIES),
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, orca = OrcaRouter Uncensored Q4_K_M")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -3605,7 +3684,7 @@ def main() -> int:
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
+                    help="UD-Q4_K_XL, UD-IQ4_XS, Q4_K_M: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
                          "more is kept as you choose, with a note)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
@@ -3896,7 +3975,8 @@ def main() -> int:
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split) unless
         # the RAM holds the GGUFs and 24 GB more: then several, without the budget, if asked for (#498)
         if MODELS[model].get("experimental"):
-            warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
+            warn(MODELS[model].get("experimental_note") or
+                 f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
                  "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
         if hip and MODELS[model].get("nvidia_only"):
             # #429 (jkuepker): checked before the 111 GB download.  The HIP engine has no prompt kernels for its
@@ -3923,7 +4003,7 @@ def main() -> int:
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
-        warn(f"--resident-budget-gib is for UD-Q4_K_XL and UD-IQ4_XS: {model} keeps all of its experts in RAM or in "
+        warn(f"--resident-budget-gib is for UD-Q4_K_XL, UD-IQ4_XS and Q4_K_M: {model} keeps all of its experts in RAM or in "
              "the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
@@ -4166,6 +4246,8 @@ def main() -> int:
             mmproj = Path(a.gguf_dir) / fam["mmproj"]
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
+        if mmproj.name in fam.get("sha256", {}):
+            verify_sha256(mmproj, *fam["sha256"][mmproj.name])
         ok(f"vision encoder: {mmproj}")
 
     # ---- 6. the pack and the MTP draft layer
