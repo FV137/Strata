@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "release": "v0.1.39",
+  "artifacts": {
+    "strata-windows-x64.zip": {
+      "version": "0.1.39",
+      "size": 123629160,
+      "sha256": "a862bcfa2330cd1c23f9b5d6e49f4027da8f8313842bd62e858ec6cd4533813a"
+    },
+    "strata-windows-x64-cuda12.zip": {
+      "version": "0.1.39",
+      "size": 175358734,
+      "sha256": "41407c01342de44e1eebf56fed46a840941a0b8328ccbf0cded0786c96838ad6"
+    },
+    "strata-windows-x64-hip.zip": {
+      "version": "0.1.39",
+      "size": 598941708,
+      "sha256": "79672951142fdf9ac20268b5a57c6f902a74015cbbcd1a3a2b46d3791704741b"
+    },
+    "llama.cpp-3cf03257f219afbe7334045ff7c6a06ac68c627d.zip": {
+      "commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+      "size": 39564399,
+      "sha256": "cbe23c594282ead2937abb3f008e51fcec4609d9256652fff42c7cc1c21ea47b"
+    }
+  }
+}
