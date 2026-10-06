@@ -21,7 +21,8 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
 "Host names", "Web pages without an API key", "Tools from MCP servers").
 
 - **Where it listens.** `127.0.0.1` by default. `--host 0.0.0.0` (or `"host"` in `strata-<model>.json`) opens it to
-  your network, and the server then warns when no API key is set.
+  your network. This fork refuses a non-loopback listener without an API key, before loading the model or
+  starting MCP servers. Docker checks this before setup too and applies environment keys on every start.
 - **API key.** `"api_key"` in the run config (or `STRATA_API_KEY`) is required on `/v1/*` and on every endpoint
   that shows the model's state, requests or answers (`/status`, `/metrics`, `/settings`, `/mcp`, `/props`, `/slots`,
   `/api/requests`, `/config`) and on every `POST`. It is compared in constant time. Set one before you open the
@@ -36,9 +37,17 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
   MCP tools are accepted only as JSON from Strata's own page (or `"trusted_origins"`), so a page elsewhere cannot
   change settings or run tools.
 - **CORS** is off unless `"cors_origins"` lists origins, and then only for `/v1/*`.
+- **Request bodies** are limited to 32 MiB (64 KiB for settings/config/load/unload/VRAM controls), with a 30-second
+  total read deadline (2 seconds for `/load` and `/unload`). Oversized requests get 413, a body deadline gets 408,
+  and malformed lengths, duplicate lengths, transfer encodings or truncated bodies get 400. This is a body-read
+  limit, not a limit on inference time or the total number of connections.
 - **MCP tools** are opt-in: only the servers you put in the run config, only for requests from Strata's own page
-  that ask for them. They run with your user's rights, and the model decides when to call them.
+  that ask for them. They run with your user's rights, and the model decides when to call them. HTTP MCP
+  redirects are rejected so configured credentials and session IDs stay at the configured endpoint; configure
+  the final endpoint URL directly.
 - **The request monitor** (`/api-monitor`, which keeps the last prompts and answers in memory) is off unless
   `"api_monitor": true` is set.
 
-Strata has not had an outside security audit yet.
+This fork has a limited source review and CPU-only regression checks documented in
+[the hardening review](docs/SECURITY_REVIEW.md). This is not a complete audit of the native engine, model files,
+dependencies or release binaries.

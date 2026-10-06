@@ -15,8 +15,10 @@
 #   docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .        # RTX 40 only
 #
 # Run (host needs an NVIDIA driver >= 580 and nvidia-container-toolkit):
+#   Export a strong STRATA_API_KEY in your shell first; the container requires it.
 #   docker run --rm --gpus all \
-#     -p 8080:8080 \
+#     -p 127.0.0.1:8080:8080 \
+#     -e STRATA_API_KEY \
 #     --ulimit memlock=-1 \
 #     -v strata-data:/data \
 #     -e MODEL=IQ2_XS \
@@ -24,13 +26,15 @@
 #
 # Setup choices are env vars, read by docker-entrypoint.sh: FAMILY, MODEL, CONTEXT,
 # VISION (no | yes | cpu), KV (int8 | q4_0 | k8v4), GPU (one card) or GPUS ("0,2"
-# or "all", with LAYER_SPLIT), LOW_RAM (auto | on | off), HOST, PORT, API_KEY.
+# or "all", with LAYER_SPLIT), LOW_RAM (auto | on | off), HOST, PORT, STRATA_API_KEY
+# (API_KEY is also accepted).
 #
 # Only the model files, the prepared pack, the MTP layer and the install config
 # live in the /data volume; the engine is part of the image. Strata loads 32-62 GB
 # into RAM, so a capped container needs -e LOW_RAM=on: setup.py reads the RAM from
 # /proc/meminfo, which here is the host's total, not the container's limit. Add an
-# API key before exposing the port to a network: -e API_KEY=<secret>. Pass
+# API key is required for the container's 0.0.0.0 listener. Publish to your LAN only
+# deliberately by changing the host side of -p; the example above is local only. Pass
 # -e REINSTALL=1 to change the model settings later.
 #
 # --gpus all on a host with two usable cards: setup takes both (the layer split is

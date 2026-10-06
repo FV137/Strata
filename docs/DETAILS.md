@@ -595,6 +595,8 @@ print(r.choices[0].message.content)
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   in an admin PowerShell, and make sure the network is set to Private.
+  This fork requires an API key for every non-loopback bind. Invalid or explicitly empty CLI/environment keys
+  stop startup before loading the model; precedence is `--api-key`, then `STRATA_API_KEY`, then the run config.
 - **From the internet.** Put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
   `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
@@ -625,6 +627,12 @@ print(r.choices[0].message.content)
   other servers) are not affected. With
   an API key, the key decides. `POST /unload` and `POST /load` take `Content-Type: application/json` from Strata's
   own page (or no `Origin`), like `/settings`.
+
+**Request size and time.** POST bodies have a 32 MiB limit and a 30-second total read deadline. Settings, config,
+load/unload and VRAM controls have a 64 KiB limit; `/load` and `/unload` keep their 2-second read deadline.
+The response is 413 for an oversized body, 408 for a body deadline, and 400 for invalid/duplicate Content-Length,
+Transfer-Encoding or an incomplete body. Send one Content-Length header; chunked request uploads are not supported.
+These limits do not apply to the model's generation time.
 
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
