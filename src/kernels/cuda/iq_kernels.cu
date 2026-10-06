@@ -307,6 +307,181 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 }
 
 // ---------------------------------------------------------------- Unsloth's UD-Q4_K_XL experts
+// Q4_0 is llama.cpp's fallback for 640-wide Q2_K/Q3_K down projections. Like Q5_0,
+// the fixed offset uses the stored Q8_1 sum, preserving the upstream activation contract.
+__device__ __forceinline__ float vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q4_0* bq4_0 = (const block_q4_0*) vbq + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = get_int_b2(bq4_0->qs, iqs + i);
+        sumi = ggml_cuda_dp4a(v & 0x0F0F0F0F, get_int_b4(bq8_1->qs, iqs + i), sumi);
+        sumi = ggml_cuda_dp4a((v >> 4) & 0x0F0F0F0F, get_int_b4(bq8_1->qs, iqs + i + QI4_0), sumi);
+    }
+    const float2 ds = __half22float2(bq8_1->ds);
+    return __half2float(bq4_0->d) * (sumi * ds.x - (8 * 2 / QI4_0) * ds.y);
+}
+
+// Q2_K / Q3_K / Q6_K: pinned llama.cpp MMVQ dots, VDR=1. The integer codes, signed
+// subblock scales and Q2_K min terms are consumed directly from the original GGUF bytes.
+__device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
+    const int & v, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const half2 & dm2, const float * __restrict__ d8) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[2*i];
+
+        const int vi = (v >> (2*i)) & 0x03030303;
+
+        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+
+        // fill int with 4x m
+        int m = sc >> 4;
+        m |= m <<  8;
+        m |= m << 16;
+        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
+    }
+
+    const float2 dm2f = __half22float2(dm2);
+
+    return dm2f.x*sumf_d - dm2f.y*sumf_m;
+}
+
+__device__ __forceinline__ float vec_dot_q2_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
+
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+    const uint8_t * scales = bq2_K->scales + scale_offset;
+
+    const int v = get_int_b4(bq2_K->qs, iqs);
+    int    u[QR2_K];
+    float d8[QR2_K];
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++ i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
+}
+
+__device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
+    const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const int & scale_offset, const float & d3, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int isc = scale_offset + 2*i;
+
+        const int isc_low = isc % (QK_K/32);
+        const int sc_shift_low = 4 * (isc / (QK_K/32));
+        const int sc_low  = (scales[isc_low] >> sc_shift_low) & 0xF;
+
+        const int isc_high = isc % (QK_K/64);
+        const int sc_shift_high = 2 * (isc / (QK_K/64));
+        const int sc_high = ((scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
+
+        const int sc = (sc_low | sc_high) - 32;
+
+        const int vil = (vl >> (2*i)) & 0x03030303;
+
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+
+        const int vi = __vsubss4(vil, vih);
+
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+    }
+
+    return d3 * sumf;
+}
+
+__device__ __forceinline__ float vec_dot_q3_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
+
+    const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+    const float d = bq3_K->d;
+
+    const int vl = get_int_b2(bq3_K->qs, iqs);
+
+    // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
+    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
+
+    int    u[QR3_K];
+    float d8[QR3_K];
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+}
+
+__device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+    const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
+    const float & d, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int sc = scales[4*i];
+
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+
+        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+    }
+
+    return d*sumf;
+}
+
+__device__ __forceinline__ float vec_dot_q6_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u[QR6_K];
+    float d8[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+    }
+
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+}
+
 // Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down: llama.cpp's vec_dot_*_q8_1 (vecdotq.cuh, VDR 2 each), transcribed; the
 // Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
 // gopinath87607), which agree with llama.cpp and with each other.
@@ -509,6 +684,14 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<2> { static constexpr int qk = 32, ipb = QI4_0 / 2, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<10> { static constexpr int qk = 256, ipb = QI2_K, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<14> { static constexpr int qk = 256, ipb = QI6_K, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q6_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -522,9 +705,9 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
+#define STRATA_GU_FMTS(X) X(2) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(14) X(6) X(8)
+#define STRATA_D_FMTS(X) X(2) X(20) X(23) X(42) X(7) X(6) X(8)
+#define STRATA_MMVQ_FMTS(X) X(2) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(14) X(7) X(6) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1479,7 +1662,50 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
-// Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
+// Pinned llama.cpp dequantizers: fold their 64 threads onto our 32-thread superblock.
+template<typename dst_t>
+__device__ void dq_q2_k(const void * vx, const int64_t ib, dst_t * yy, const int lane) {
+    for (int tid = lane; tid < 64; tid += 32) {
+        const block_q2_K * x = (const block_q2_K *) vx;
+
+        const int64_t n   = tid/32;
+        const int64_t l   = tid - 32*n;
+        const int64_t is  = 8*n + l/16;
+
+        const uint8_t q = x[ib].qs[32*n + l];
+        dst_t * y = yy + 128*n;
+
+        float dall = __low2half(x[ib].dm);
+        float dmin = __high2half(x[ib].dm);
+        y[l+ 0] = cvt<dst_t>(dall * (x[ib].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[ib].scales[is+0] >> 4));
+        y[l+32] = cvt<dst_t>(dall * (x[ib].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[ib].scales[is+2] >> 4));
+        y[l+64] = cvt<dst_t>(dall * (x[ib].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[ib].scales[is+4] >> 4));
+        y[l+96] = cvt<dst_t>(dall * (x[ib].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[ib].scales[is+6] >> 4));
+    }
+}
+template<typename dst_t>
+__device__ void dq_q6_k(const void * vx, const int64_t ib, dst_t * yy, const int lane) {
+    for (int tid = lane; tid < 64; tid += 32) {
+        const block_q6_K * x = (const block_q6_K *) vx;
+
+        const int64_t ip  = tid/32;   // ip is 0 or 1
+        const int64_t il  = tid - 32*ip; // 0...32
+        const int64_t is  = 8*ip + il/16;
+
+        dst_t * y = yy + 128*ip + il;
+
+        const float d = x[ib].d;
+
+        const uint8_t * ql = x[ib].ql + 64*ip + il;
+        const uint8_t   qh = x[ib].qh[32*ip + il];
+        const int8_t  * sc = x[ib].scales + is;
+
+        y[ 0] = cvt<dst_t>(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+        y[32] = cvt<dst_t>(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+        y[64] = cvt<dst_t>(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+        y[96] = cvt<dst_t>(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    }
+}
 template<typename dst_t>
 __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q3_K* x = (const block_q3_K*) vx + ibs;
@@ -1589,6 +1815,18 @@ __device__ void dq_q5_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 template<typename dst_t>
+__device__ void dq_q4_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q4_0* x = (const block_q4_0*) vx + ibs * (QK_K / QK4_0);
+    const int ib = tid % 8, il = tid / 8;
+    const float d = __half2float(x[ib].d);
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int i = 4 * il + j;
+        y[i] = cvt<dst_t>(d * ((int) (x[ib].qs[i] & 15) - 8));
+        y[i + 16] = cvt<dst_t>(d * ((int) (x[ib].qs[i] >> 4) - 8));
+    }
+}
+template<typename dst_t>
 __device__ void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     // symmetric: one delta (no min), the high bit folded in then centered by the format's fixed -16 offset
     const block_q5_0* x = (const block_q5_0*) vx + ibs * (QK_K / QK5_0);
@@ -1650,11 +1888,14 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;
+        case 14: dq_q6_k(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
         case 7: dq_q5_1(vx, ibs, y, tid); break;
+        case 2: dq_q4_0(vx, ibs, y, tid); break;
         case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
@@ -1679,8 +1920,8 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+    return t == 2 || t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+           t == 10 || t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1787,11 +2028,14 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
+        case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
+        case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)

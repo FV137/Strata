@@ -20,7 +20,7 @@ What the first run does (each step is skipped when it is already done):
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
-Options: --family qwen|swift|coder|unsloth|orca, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|Q4_K_M, --context 32768, --rope-scaling none|linear|yarn
+Options: --family qwen|swift|coder|unsloth|orca, --model QUANT (see --help), --context 32768, --rope-scaling none|linear|yarn
 (--rope-scale F; past the trained 262144 the setup adds yarn and the factor is the final context over 262144,
 at least 1 - an explicit --rope-scaling none is refused for such a context), --vision yes|no|gpu|cpu, --port
 8080, --yes (recommended
@@ -36,15 +36,16 @@ than it recommends - a longer context, more GPUs, a bigger RAM budget, a size it
 what it risks.  With --yes, an explicit flag (--model, --gpus, ...) is the consent to a risk setup would otherwise
 stop at; --yes alone is not.
 
-OrcaRouter Q4_K_M: --family orca --model Q4_K_M (experimental, ~119.2 GB in three shards).
+OrcaRouter: --family orca --model Q4_K_M (default); all published quants are experimental.
 Accept the Hugging Face repository's access terms, then set HF_TOKEN locally for downloads, or use
---gguf-dir with the three original filenames. The token is used only for this repository over HTTPS,
+--gguf-dir with the selected quant's original shard filenames. The token is used only for this repository over HTTPS,
 is not forwarded to redirects, and is never written to a run config. This option pins and verifies the
 model files; it has not been generation-tested by this installer change.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -53,6 +54,8 @@ import os
 import platform
 import re
 import shutil
+import stat
+import tempfile
 import struct
 import subprocess
 import sys
@@ -63,6 +66,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
+
+from serve.gpu_devices import cuda_visible_gpus, nvidia_gpus
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
@@ -80,6 +85,9 @@ HF_REVISIONS = {
 
 HF_DEFAULT = "https://huggingface.co"
 ORCA_REPO = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"
+ORCA_CATALOG = json.loads((Path(__file__).resolve().parent / "orca-quants.json").read_text(encoding="utf-8"))
+if ORCA_CATALOG["repository"] != ORCA_REPO or ORCA_CATALOG["revision"] != HF_REVISIONS[ORCA_REPO]:
+    raise ValueError("Orca catalog does not match the reviewed repository snapshot")
 
 
 def hf_endpoint() -> str:
@@ -104,13 +112,12 @@ HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
-# The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
-# by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
-# "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
-# With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
-# tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+# Reviewed release snapshot; never fall forward to latest. See docs/ENGINE_DOWNLOAD_SECURITY.md.
+PREBUILT_RELEASE = "v0.1.39"
+PREBUILT_URL = f"https://github.com/Niko1221/Strata/releases/download/{PREBUILT_RELEASE}/"
 PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
+ARTIFACT_MANIFEST = Path(__file__).resolve().parent / "engine-artifacts.json"
+ARTIFACT_MANIFEST_OVERRIDE = None
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
@@ -160,19 +167,40 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
-    # The shard total is a conservative upper bound for the expert arena, NOT a measured RAM requirement.
-    # Use the existing RAM-budget path; the engine sizes its actual experts from the GGUF tensor directories.
-    "Q4_K_M": {"about": "OrcaRouter Uncensored, EXPERIMENTAL: ~119.2 GB download; a RAM budget of experts, "
-                       "the remainder read from the SSD; throughput and quality not measured here",
-               "download_gb": 119.2, "ram_gb": 48, "arena_gb": 119.2, "families": ("orca",),
-               "budget": True, "nvidia_only": True, "experimental": True, "engine": (0, 1, 38),
-               "experimental_note": "OrcaRouter Q4_K_M is EXPERIMENTAL. Engine 0.1.38 added its Q5_0 expert "
-                                    "support (#473). This installer integration has not been generation-tested. "
-                                    "RAM planning uses the full shard size as a conservative arena upper bound; "
-                                    "48 GB is the inherited budget-mode planning threshold, not a measured minimum. "
-                                    "The original Qwen draft head is verified by the Orca target; acceptance and "
-                                    "speed need measurement on your hardware."},
 }
+# Keep the public quant names. IQ3_XXS also names a different Qwen/Swift profile; never overwrite it globally.
+# The full shard total is an upper bound for the arena, not a measured expert size or RAM requirement.
+ORCA_SOURCE_QUANTS = frozenset({"Q2_K", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q6_K"})
+ORCA_ENGINE_REQUIREMENT = "orca-k-quants-v1"
+ORCA_MODELS = {
+    quant: {"about": "OrcaRouter Uncensored, EXPERIMENTAL: a RAM budget of experts; the remainder read from the "
+                     "SSD; throughput and quality not measured here",
+            "download_gb": sum(shard["size"] for shard in shards) / 1e9, "ram_gb": 48,
+            "arena_gb": sum(shard["size"] for shard in shards) / 1e9, "families": ("orca",),
+            "budget": True, "nvidia_only": True, "experimental": True, "engine": (0, 1, 38),
+            "source_engine": quant in ORCA_SOURCE_QUANTS,
+            "experimental_note": f"OrcaRouter {quant} is EXPERIMENTAL. This installer integration has not been "
+                                 "generation-tested. RAM planning uses the full shard size as a conservative arena "
+                                 "upper bound; 48 GB is the inherited budget-mode planning threshold, not a measured "
+                                 "minimum. The original Qwen draft head is verified by the Orca target; acceptance "
+                                 "and speed need measurement on your hardware."}
+    for quant, shards in ORCA_CATALOG["variants"].items()
+}
+for _quant, _profile in ORCA_MODELS.items():
+    MODELS.setdefault(_quant, _profile)
+
+
+def family_models(family: str) -> dict:
+    """Profiles keyed by the names users select, scoped to their weight family."""
+    if family == "orca":
+        return ORCA_MODELS
+    return {m: d for m, d in MODELS.items() if family in d.get("families", ("qwen", "swift"))}
+
+
+def model_profile(model: str, family: str | None = None) -> dict:
+    return ORCA_MODELS[model] if family == "orca" else MODELS[model]
+
+
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
 UNSLOTH_SHARDS = {
@@ -247,7 +275,8 @@ FAMILIES = {
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
     "orca": {"title": "Qwen3.8-Flash-Next Uncensored (OrcaRouter)", "by": "OrcaRouter",
-             "about": "Q4_K_M, experimental; ~119.2 GB; gated download: accept access terms and set HF_TOKEN",
+             "about": "all published quants, experimental; Q4_K_M by default; accept access terms and set HF_TOKEN",
+             "default_model": "Q4_K_M",
              "hf": hf(ORCA_REPO), "file": "Qwen3.8-Flash-Next-Uncensored-{q}-0000{i}-of-00003.gguf",
              "shards": 3, "strict_shards": True, "tag": "orca-", "mmproj_hf": hf(ORCA_REPO),
              "mmproj": "mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf",
@@ -568,18 +597,14 @@ def _cpuid_avx2() -> bool:
 
 
 def gpus():
-    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
-             "--format=csv,noheader,nounits"])
-    found = []
-    for line in s.strip().splitlines():
-        try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
-        except ValueError:
-            continue
-    return found
+    """Visible NVIDIA GPUs, retaining nvidia-smi IDs even when CUDA renumbers them."""
+    found = nvidia_gpus()
+    if not found:
+        return []                                     # AMD-only setup must not initialize an absent CUDA driver
+    try:
+        return cuda_visible_gpus(found)
+    except ValueError as error:
+        fail(str(error))
 
 
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
@@ -722,7 +747,8 @@ def parse_gpus(text, found) -> list:
         sel = [g["index"] for g in together_ok(found)]
         if not sel:
             gpu_table(found)
-            fail("--gpus all: this PC does not have two GPUs Strata can use together")
+            fail("--gpus all: this process does not see two GPUs Strata can use together",
+                 "check nvidia-smi here, CUDA_VISIBLE_DEVICES and Docker's --gpus; use --gpu N for one visible card")
         return sel
     try:
         sel = [int(x) for x in str(text).split(",") if x.strip()]
@@ -740,7 +766,8 @@ def check_gpus(sel, found, what="", yes=False, named=False) -> None:
     together = len(sel) > 1
     for i in sel:
         g = next((x for x in found if x["index"] == i), None)
-        p = "not found on this PC" if g is None else gpu_problem(g, together)
+        p = ("not visible to this process (check nvidia-smi, CUDA_VISIBLE_DEVICES and Docker's --gpus)"
+             if g is None else gpu_problem(g, together))
         if p is None:
             continue
         if named and g is not None and gpu_problem(g) is None:     # it runs Strata; only its VRAM is small
@@ -857,26 +884,55 @@ def split_mmap(cfg: dict) -> bool:
 
 def model_file(fam: dict, model: str, i: int) -> str:
     """Shard i's file name: the family's pattern, or the model's own (#621: UD-IQ4_XS has three shards, not four)."""
+    if fam.get("tag") == "orca-":
+        return ORCA_CATALOG["variants"][model][i - 1]["name"]
     return MODELS.get(model, {}).get("file", fam["file"]).format(q=model, i=i)
 
 
 def model_shards(fam: dict, model: str) -> int:
+    if fam.get("tag") == "orca-":
+        return len(ORCA_CATALOG["variants"][model])
     return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
 
 
-def budget_model(cfg: dict) -> str:
-    """The Unsloth model a config with a RAM budget runs, from its --native shard's name (UD-Q4_K_XL by default)."""
+def config_model_choice(cfg: dict) -> tuple | None:
+    """Infer the exact family/quant from the native first shard, including Q8_0-MTP's full suffix."""
     a = cfg.get("args", [])
-    native = Path(a[a.index("--native") + 1]).name.upper() if "--native" in a and a.index("--native") + 1 < len(a) \
-        else ""
-    return next((m for m, d in MODELS.items() if d.get("budget") and f"-{m}-" in native), "UD-Q4_K_XL")
+    if "--native" in a[:-1]:
+        # Configs may have been written on Windows before being moved to Linux.
+        name = a[a.index("--native") + 1].replace("\\", "/").rsplit("/", 1)[-1]
+        found = gguf_choice(name)
+        if found:
+            return found
+    name = cfg.get("model_name", "")
+    for family, fam in FAMILIES.items():
+        for model in family_models(family):
+            if name == f"{fam['name']}-{model.lower()}":
+                return family, model
+    return None
 
 
-def unsloth_split_need_gb(model="UD-Q4_K_XL") -> float:
+def budget_model(cfg: dict) -> str:
+    """The budget model's public quant name; legacy Unsloth configs retain their old fallback."""
+    choice = config_model_choice(cfg)
+    if choice and model_profile(choice[1], choice[0]).get("budget"):
+        return choice[1]
+    a = cfg.get("args", [])
+    native = str(a[a.index("--native") + 1]).upper() if "--native" in a[:-1] else ""
+    return next((m for m in sorted(MODELS, key=len, reverse=True)
+                 if MODELS[m].get("budget") and f"-{m}-" in native), "UD-Q4_K_XL")
+
+
+def budget_family(cfg: dict) -> str | None:
+    choice = config_model_choice(cfg)
+    return choice[0] if choice else None
+
+
+def unsloth_split_need_gb(model="UD-Q4_K_XL", family=None) -> float:
     """#498: the RAM UD-Q4_K_XL needs on several GPUs, where it has no RAM budget (the engine refuses
     --resident-budget-gib with a layer split): its GGUF files and UNSLOTH_RAM_LEFT_GB more (~135 GB).  Measured safe
     at 165 GiB (2x RTX 3090: MemAvailable never under 68 GiB); the 0-free case of #384 was 47 GB with a 70 GB model."""
-    return MODELS[model]["download_gb"] + UNSLOTH_RAM_LEFT_GB
+    return model_profile(model, family)["download_gb"] + UNSLOTH_RAM_LEFT_GB
 
 
 def split_budget(cfg: dict) -> bool:
@@ -888,7 +944,7 @@ def split_budget(cfg: dict) -> bool:
     if "--resident-budget-gib" not in a:
         return False
     model = budget_model(cfg)
-    need, ram = unsloth_split_need_gb(model), ram_gb()
+    need, ram = unsloth_split_need_gb(model, budget_family(cfg)), ram_gb()
     if ram < need:
         fail(f"{model} cannot share its RAM budget across GPUs (the engine has no layer split with it), and without "
              f"the budget it needs ~{need:.0f} GB of RAM (its GGUF files and {UNSLOTH_RAM_LEFT_GB} GB more); this PC "
@@ -934,7 +990,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         return cfg
     # #498: UD-Q4_K_XL's RAM budget has no layer split; without it the RAM must hold the GGUFs and 24 GB more
     budget = "--resident-budget-gib" in cfg.get("args", [])
-    if budget and ram_gb() < unsloth_split_need_gb(budget_model(cfg)):
+    if budget and ram_gb() < unsloth_split_need_gb(budget_model(cfg), budget_family(cfg)):
         return cfg
     pair = can[:2]
     cfg["gpus_asked"] = True
@@ -947,7 +1003,10 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
         say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
         say("  use). On both, the experts the GPUs do not hold are read through the OS file cache instead: faster in")
         say("  two reports (#364, #384), but RAM can fill up to 0 free during long prompts.")
-    if budget:
+    if budget and budget_family(cfg) == "orca":
+        say("  Orca multi-GPU performance has not been measured here. Both GPUs require its full GGUF size plus")
+        say("  24 GB of RAM; a single GPU uses the conservative RAM-budget starting point.")
+    elif budget:
         say(f"  This model ({budget_model(cfg)}) runs on one GPU with a RAM budget of its experts (recommended: the tested")
         say("  setup). On both it has no budget: all its experts are loaded into RAM at start, which this PC's RAM")
         say("  holds - about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s).")
@@ -1057,6 +1116,269 @@ def free_gb(path):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
+class ArtifactError(ValueError):
+    """A downloaded archive or installed tree does not match the configured trust anchor."""
+
+
+def artifact_spec(asset, custom=False):
+    """Only a committed manifest, or a manifest explicitly supplied by the user, can authorize bytes."""
+    path = (ARTIFACT_MANIFEST_OVERRIDE or os.environ.get("STRATA_ARTIFACT_MANIFEST")) if custom else None
+    if custom and not path:
+        raise ArtifactError("custom --prebuilt requires --artifact-manifest (or STRATA_ARTIFACT_MANIFEST)")
+    try:
+        data = json.loads(Path(path or ARTIFACT_MANIFEST).read_text(encoding="utf-8"))
+        spec = data["artifacts"][asset]
+        if not isinstance(spec, dict) or type(spec.get("size")) is not int or not 0 < spec["size"] <= 1 << 30 or \
+                not re.fullmatch(r"[0-9a-f]{64}", str(spec.get("sha256", ""))):
+            raise ValueError("invalid size or SHA-256")
+        return spec
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ArtifactError(f"no trusted size/SHA-256 for {asset} in {path or ARTIFACT_MANIFEST}: {e}") from e
+
+
+def artifact_cache(asset, spec):
+    # Keep previous releases' archives: a failed update must not remove their integrity evidence.
+    return ROOT / ".cache" / "engine-artifacts" / spec["sha256"] / asset
+
+
+def stream_sha256(stream):
+    h = hashlib.sha256()
+    for block in iter(lambda: stream.read(1 << 20), b""):
+        h.update(block)
+    return h.hexdigest()
+
+
+def verify_artifact(path, spec):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != spec["size"]:
+        raise ArtifactError(f"{path.name}: archive size does not match the trusted manifest")
+    with path.open("rb") as f:
+        if stream_sha256(f) != spec["sha256"]:
+            raise ArtifactError(f"{path.name}: archive SHA-256 does not match the trusted manifest")
+
+
+def download_artifact(url, asset, spec):
+    """Bounded, non-resuming download. Re-hash cached bytes every time; .done has no authority here."""
+    dst = artifact_cache(asset, spec)
+    if dst.exists() or dst.is_symlink():
+        try:
+            verify_artifact(dst, spec)
+        except ArtifactError:
+            dst.unlink(missing_ok=True)
+            raise
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # A unique temporary file prevents overlapping setup runs from sharing partially written bytes.
+    with tempfile.NamedTemporaryFile(dir=dst.parent, prefix="download-", delete=False) as f:
+        partial = Path(f.name)
+        try:
+            if url.startswith(("http://", "https://")):
+                if not url.startswith("https://"):
+                    raise ArtifactError("engine/source downloads require HTTPS or an explicit local path")
+                source = urllib.request.urlopen(download_request(url), timeout=60)
+                if not source.geturl().startswith("https://"):
+                    source.close()
+                    raise ArtifactError("engine/source download redirected away from HTTPS")
+            else:
+                source = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path)
+                              if url.startswith("file://") else url).open("rb")
+            with source:
+                size = 0
+                while True:
+                    block = source.read(min(1 << 20, spec["size"] + 1 - size))
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > spec["size"]:
+                        raise ArtifactError(f"{asset}: download exceeds trusted size")
+                    f.write(block)
+            f.flush()
+            verify_artifact(partial, spec)
+            f.close()                                 # Windows cannot rename an open NamedTemporaryFile
+            partial.replace(dst)
+        finally:
+            f.close()
+            partial.unlink(missing_ok=True)
+    return dst
+
+
+def archive_path(name):
+    """Portable relative paths only, including Windows device names/ADS and case aliases."""
+    parts = name.rstrip("/").split("/")
+    if not name or name.startswith("/") or "\\" in name or any(
+            not p or p in (".", "..") or p[-1:] in (".", " ") or re.search(r'[<>:"|?*\x00-\x1f]', p) or
+            re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", p, re.I) for p in parts):
+        raise ArtifactError(f"unsafe archive path: {name!r}")
+    return "/".join(parts)
+
+
+def archive_members(z, *, source=False):
+    """Validate the entire directory before any entry is written, including skipped source UI files."""
+    members, names, total = [], {}, 0
+    infos = z.infolist()
+    if len(infos) > 100000:
+        raise ArtifactError("archive has too many entries")
+    limit = 512 << 20 if source else 8 << 30
+    for info in infos:
+        name = archive_path(info.orig_filename)
+        mode = stat.S_IFMT(info.external_attr >> 16)
+        if mode not in (0, stat.S_IFREG, stat.S_IFDIR) or info.flag_bits & 1:
+            raise ArtifactError(f"unsupported archive entry: {name}")
+        if (mode == stat.S_IFDIR and not info.is_dir()) or (mode == stat.S_IFREG and info.is_dir()):
+            raise ArtifactError(f"invalid archive directory: {name}")
+        if info.file_size < 0 or info.file_size > min(limit, 4 << 30) or \
+                (name == "BUILD.json" and info.file_size > 1 << 20):
+            raise ArtifactError("archive entry is too large")
+        total += info.file_size
+        if total > limit:
+            raise ArtifactError("archive expands beyond the size limit")
+        key = name.casefold()
+        if key in names:
+            raise ArtifactError(f"duplicate archive path: {name}")
+        names[key] = info.is_dir()
+        members.append((info, name))
+    for key in names:
+        parts = key.split("/")
+        if any(names.get("/".join(parts[:i])) is False for i in range(1, len(parts))):
+            raise ArtifactError(f"archive file is also a directory: {key}")
+    return members
+
+
+def artifact_files(z, *, source=False):
+    files = {}
+    prefix = f"llama.cpp-{LLAMA_CPP_COMMIT}/"
+    for info, name in archive_members(z, source=source):
+        if source:
+            if not (name + "/").startswith(prefix):
+                raise ArtifactError("source archive has an unexpected commit/root directory")
+            name = name[len(prefix):]
+            if name == "tools/ui" or name.startswith("tools/ui/"):
+                continue                              # Windows' path limit; this web UI is not built by Strata
+        if not source and name.casefold() == ".artifact.json":
+            raise ArtifactError("archive cannot supply setup's integrity receipt")
+        if not info.is_dir():
+            files[name] = info
+    return files
+
+
+def extract_artifact(z, dst, *, source=False):
+    files = artifact_files(z, source=source)
+    for name, info in files.items():
+        out = dst / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with z.open(info) as src, out.open("xb") as target:
+            shutil.copyfileobj(src, target, 1 << 20)
+        if out.stat().st_size != info.file_size:
+            raise ArtifactError(f"archive entry size mismatch: {name}")
+    return files
+
+
+def tree_matches_archive(folder, z, *, source=False, hip=False):
+    if folder.is_symlink() or not folder.is_dir():
+        return False
+    files = artifact_files(z, source=source)
+    # HIP's bundled runtime is also placed beside the executable, as on a fresh verified installation.
+    if hip:
+        for name, info in list(files.items()):
+            if name.startswith("rocm/bin/") and any(Path(name).match(p) for p in HIP_RUNTIME_DLLS):
+                files.setdefault(Path(name).name, info)
+    actual = set()
+    for path in folder.rglob("*"):
+        if path.is_symlink():
+            return False
+        if not path.is_file():
+            continue
+        name = path.relative_to(folder).as_posix()
+        if name == ".artifact.json" and not source:
+            continue                                  # merely identifies the manifest/zip, never authorizes it
+        actual.add(name)
+    if actual != set(files):
+        return False
+    for name, info in files.items():
+        path = folder / name
+        if path.stat().st_size != info.file_size:
+            return False
+        with path.open("rb") as f, z.open(info) as original:
+            if stream_sha256(f) != stream_sha256(original):
+                return False
+    return True
+
+
+def replace_artifact_tree(staged, target):
+    """Swap complete directories, restoring the old one if activation fails (including Windows locks)."""
+    backup = target.with_name(target.name + ".previous")
+    if backup.exists():
+        raise ArtifactError(f"{backup} exists from an interrupted update; restore or move it before retrying")
+    had_old = target.exists()
+    if had_old:
+        target.replace(backup)
+    try:
+        staged.replace(target)
+    except BaseException:
+        if had_old:
+            backup.replace(target)
+        raise
+    if had_old:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def read_engine_meta(eng):
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def is_local_engine(meta):
+    return meta.get("source") in ("local", "local-hip")
+
+
+@contextlib.contextmanager
+def local_build_tree(target, source):
+    """Never carry downloaded executables or libraries into a directory granted local-build trust."""
+    if read_engine_meta(target).get("source") == source:
+        yield target  # Existing local compilation inputs/outputs remain a separate trusted boundary.
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="_local-engine-", dir=target.parent) as staging:
+        staged = Path(staging) / "engine"
+        staged.mkdir()
+        yield staged
+        replace_artifact_tree(staged, target)
+
+
+def installed_prebuilt_verified(eng):
+    """Re-derive every expected file from a hashed archive; no mutable receipt or BUILD.json is proof."""
+    try:
+        receipt = json.loads((eng / ".artifact.json").read_text(encoding="utf-8"))
+        asset = archive_path(receipt["asset"])
+        if "/" in asset:
+            return False
+        spec = artifact_spec(asset, custom=bool(receipt.get("custom")))
+        if receipt.get("sha256") != spec["sha256"]:
+            return False
+        archive = artifact_cache(asset, spec)
+        verify_artifact(archive, spec)
+        with zipfile.ZipFile(archive) as z:
+            return tree_matches_archive(eng, z, hip=asset == WIN_HIP_ASSET)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, RuntimeError):
+        return False
+
+
+def require_verified_engine(exe):
+    eng = Path(exe).parent
+    meta = read_engine_meta(eng)
+    if is_local_engine(meta):
+        return                                        # user-controlled local builds are a separate trust boundary
+    if eng.resolve() not in (engine_dir(13).resolve(), engine_dir(12).resolve()) and \
+            meta.get("source") != "prebuilt":
+        return                                        # an explicitly configured external local executable
+    if not installed_prebuilt_verified(eng):
+        fail("the installed ready-made engine has not passed integrity verification",
+             "run setup again to install the pinned verified engine, or compile it locally with --build; "
+             "the previous files have been preserved")
+
+
 def drop_archive(z: Path) -> None:
     """An unpacked or refused engine archive and its .done mark go: a refused one kept them, and every later run
     reused it ("already downloaded") instead of the published one (PR #324)."""
@@ -1069,7 +1391,7 @@ def download_request(url: str, method="GET", headers=None):
     req = urllib.request.Request(url, method=method, headers={"User-Agent": "strata-setup", **(headers or {})})
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme == "https" and parsed.netloc == "huggingface.co" and \
-            parsed.path.startswith(f"/{ORCA_REPO}/resolve/"):
+            parsed.path.startswith((f"/{ORCA_REPO}/resolve/", f"/{ORCA_REPO}/raw/")):
         token = os.environ.get("HF_TOKEN", "").strip()
         if token:
             req.add_unredirected_header("Authorization", f"Bearer {token}")
@@ -1079,15 +1401,66 @@ def download_request(url: str, method="GET", headers=None):
 def orca_download_error(url: str, error) -> None:
     """A gate or missing pinned file needs user action, not repeated downloads or a different revision."""
     if not isinstance(error, urllib.error.HTTPError) or \
-            not urllib.parse.urlsplit(url).path.startswith(f"/{ORCA_REPO}/resolve/"):
+            not urllib.parse.urlsplit(url).path.startswith((f"/{ORCA_REPO}/resolve/", f"/{ORCA_REPO}/raw/")):
         return
     if error.code in (401, 403):
         fail("OrcaRouter download requires Hugging Face access",
              f"accept access at https://huggingface.co/{ORCA_REPO} and set HF_TOKEN locally (sent only to "
-             "https://huggingface.co, never to mirrors or redirects), or pass --gguf-dir with the three original shards")
+             "https://huggingface.co, never to mirrors or redirects). Local shards also need verified checksum "
+             "metadata: see docs/ORCA_QUANTS.md")
     if error.code == 404:
         fail("the pinned OrcaRouter file is unavailable; refusing to switch to main",
              "check the repository access and pinned revision, or use --gguf-dir with the pinned original shards")
+
+
+def orca_checksums(model: str, cache_dir: Path) -> dict:
+    """Resolve gated weight hashes through the committed Git LFS pointer IDs, never through mutable metadata.
+
+    The public Hub tree exposes Git blob IDs but redacts LFS SHA-256 values for gated files. Authenticate to
+    read each tiny raw pointer at the pinned revision, verify its Git blob ID, then read the weight SHA-256.
+    Cached pointers are checked again on every use, allowing subsequent offline setup with local shards.
+    """
+    result = {}
+    for entry in ORCA_CATALOG["variants"][model]:
+        name, size = entry["name"], entry["size"]
+        if name in ORCA_Q4_K_M_SHARDS:                 # hashes already reviewed and committed directly
+            result[name] = ORCA_Q4_K_M_SHARDS[name]
+            continue
+        cached = cache_dir / (entry["pointer_oid"] + ".lfs")
+        url = f"{hf_endpoint()}/{ORCA_REPO}/raw/{HF_REVISIONS[ORCA_REPO]}/{name}"
+        try:
+            if cached.exists():
+                with cached.open("rb") as stream:
+                    body = stream.read(1025)
+            else:
+                with urllib.request.urlopen(download_request(url), timeout=30) as response:
+                    body = response.read(1025)         # never stream a resolved multi-GB weight into memory
+        except (OSError, urllib.error.HTTPError) as error:
+            orca_download_error(url, error)
+            fail(f"cannot read pinned checksum metadata for {name}",
+                 "check access/network or restore the verified metadata cache; no unverified weights will be used")
+        blob_oid = hashlib.sha1(b"blob " + str(len(body)).encode("ascii") + b"\0" + body).hexdigest()
+        pointer = re.fullmatch(rb"version https://git-lfs.github.com/spec/v1\n"
+                               rb"oid sha256:([0-9a-f]{64})\nsize ([0-9]+)\n", body)
+        if len(body) != entry["pointer_size"] or len(body) > 1024 or blob_oid != entry["pointer_oid"] or \
+                not pointer or int(pointer[2]) != size:
+            fail(f"pinned checksum metadata mismatch for {name}",
+                 f"refusing this pointer; check the download source or remove damaged cache file {cached}")
+        result[name] = (size, pointer[1].decode("ascii"))
+        if not cached.exists():
+            temporary = None
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=cache_dir, prefix="pointer-", delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(body)
+                temporary.replace(cached)
+            except OSError:
+                fail(f"cannot save verified checksum metadata for {name}", "check the data folder's permissions")
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+    return result
 
 
 def download(url, dst: Path, what=None):
@@ -1205,11 +1578,11 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 
 
 # #444: the quantization in a GGUF's name (Unsloth's UD-IQ3_XXS, a K-quant's Q2_K_XL, a GSQ-RCO IQ3_S, ...)
-GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
+GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*(?:-MTP)?|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
                    "1.5's; the Coder's IQ1_M), Unsloth's UD-Q4_K_XL and UD-IQ4_XS, and the experimental "
-                   "OrcaRouter Uncensored Q4_K_M: other GGUFs (Unsloth's "
+                   "published OrcaRouter Uncensored quants: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
                    "UD-Q2_K_XL, K-quants) cannot be used")
 
@@ -1217,9 +1590,11 @@ SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next 
 def gguf_unsupported(name: str) -> str | None:
     """#444: the quantization a GGUF's name says, when it is one Strata cannot run (not a setup size); else None."""
     m = GGUF_QUANT.search(name)
-    if m and m.group(1).upper() == "Q4_K_M" and name not in ORCA_Q4_K_M_SHARDS and \
+    if m and m.group(1).upper() in ORCA_MODELS and \
+            MODELS[m.group(1).upper()].get("families") == ("orca",) and \
+            not any(name == shard["name"] for shards in ORCA_CATALOG["variants"].values() for shard in shards) and \
             not name.lower().startswith("mmproj"):
-        return m.group(1)                             # only the pinned Orca files, not arbitrary Q4_K_M models
+        return m.group(1)                             # only the pinned Orca files, not arbitrary models
     return m.group(1) if m and m.group(1).upper() not in MODELS and not name.lower().startswith("mmproj") else None
 
 
@@ -1227,8 +1602,8 @@ def gguf_choice(name: str) -> tuple | None:
     """#444: (--family, --model) whose published first shard this file is, or None (the Coder's IQ1_M is named like
     the original's sizes: the size tells them apart)."""
     for f, d in FAMILIES.items():
-        for m in MODELS:
-            if f in MODELS[m].get("families", ("qwen", "swift")) and name == model_file(d, m, 1):
+        for m in family_models(f):
+            if name == model_file(d, m, 1):
                 return f, m
     return None
 
@@ -1242,6 +1617,10 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     if bad:
         return f"{first.name} is {bad}, a GGUF Strata cannot run", SUPPORTED_GGUFS
     if first.exists():
+        choice = gguf_choice(first.name)
+        if choice and (FAMILIES[choice[0]]["tag"] != fam["tag"] or choice[1] != model):
+            return (f"{first.name} belongs to a different model than {fam['title']} {model}",
+                    f"use --family {choice[0]} --model {choice[1]}, or supply this choice's original shards")
         return None
     firsts = sorted(p.name for p in folder.glob("*.gguf")
                     if not p.name.lower().startswith("mmproj") and (not SHARD_NAME.search(p.name)
@@ -1262,11 +1641,18 @@ def verify_sha256(s: Path, size: int, sha: str) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
     so the ~5 minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again."""
     m = s.with_name(s.name + ".done")
-    if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
-        return
     have = s.stat().st_size if s.exists() else -1
     if have != size:
         fail(f"{s.name} is {have:,} bytes, not {size:,}", "delete it and run setup again (the download restarts)")
+    def identity():
+        st = s.stat()
+        return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_dev, st.st_ino]
+    before = identity()
+    receipt = f"sha256 {sha}\nfile {json.dumps(before)}"
+    # A local receipt saves re-reading hundreds of GB, but a bare old hash marker must not bless a
+    # replaced/truncated file. This detects ordinary file changes; the local filesystem remains trusted.
+    if m.exists() and m.read_text(encoding="utf-8", errors="replace").strip() == receipt:
+        return
     say(f"  checking {s.name} (SHA-256, {size / 1e9:.1f} GB) ...")
     h = hashlib.sha256()
     with open(s, "rb") as f:
@@ -1275,26 +1661,28 @@ def verify_sha256(s: Path, size: int, sha: str) -> None:
             if not b:
                 break
             h.update(b)
+    if identity() != before:
+        fail(f"{s.name} changed during SHA-256 verification", "stop other writers and run setup again")
     if h.hexdigest() != sha:
         s.unlink(missing_ok=True)
         m.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({h.hexdigest()}, expected {sha}): deleted",
              "run setup again to download it again")
-    mark(s, f"sha256 {sha}")
+    mark(s, receipt)
 
 
-def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
+def resident_budget_gib(model, ram, kv_ram_gb=0.0, family=None) -> int:
     """UD-Q4_K_XL: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GiB, ram_gb()) less
     24 for the OS, the engine and the file cache the other experts are read through, less a KV cache streamed to
     RAM; at most all of them, at least 8.  64 GB: 40, the measured setting (docs/UNSLOTH_Q4.md)."""
     gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
-    return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
+    return max(8, min(gib, int(model_profile(model, family)["arena_gb"] / 1.073741824)))
 
 
-def budget_choice(model, ram, asked) -> float:
+def budget_choice(model, ram, asked, family=None) -> float:
     """S4: UD-Q4_K_XL's RAM budget: --resident-budget-gib N as given, else the recommendation (resident_budget_gib).
     More than the recommendation is kept, with what it risks (the owner's rule: setup recommends, it never forces)."""
-    rec = resident_budget_gib(model, ram)
+    rec = resident_budget_gib(model, ram, family=family)
     if asked is None:
         return rec
     if asked > rec:
@@ -1327,36 +1715,30 @@ def check_shards(shards):
 
 
 def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
-    llama = ROOT / "third_party" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+    """Pinned, verified source; legacy source folders are replaced only after a complete verified extraction."""
+    try:
+        llama = ROOT / "third_party" / "llama.cpp"
+        asset = f"llama.cpp-{LLAMA_CPP_COMMIT}.zip"
+        spec = artifact_spec(asset)
+        if spec.get("commit") != LLAMA_CPP_COMMIT:
+            raise ArtifactError("source manifest does not match LLAMA_CPP_COMMIT")
+        archive = download_artifact(LLAMA_CPP_ZIP, asset, spec)
+        with zipfile.ZipFile(archive) as z:
+            if tree_matches_archive(llama, z, source=True):
+                return llama
+            llama.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="_source-", dir=llama.parent) as staging:
+                staged = Path(staging) / "llama.cpp"
+                staged.mkdir()
+                extract_artifact(z, staged, source=True)
+                if not (staged / "ggml" / "CMakeLists.txt").is_file() or not (staged / "gguf-py").is_dir():
+                    raise ArtifactError("source archive lacks ggml or gguf-py")
+                replace_artifact_tree(staged, llama)
         return llama
-    z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
-    download(LLAMA_CPP_ZIP, z, "llama.cpp source")
-    tmp = ROOT / "third_party" / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
-        # folder like Downloads\Strata-main\Strata-main (#206)
-        f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
-    top = next(tmp.iterdir())
-    shutil.rmtree(llama, ignore_errors=True)
-    # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
-    # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
-    # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
-    for attempt in range(5):
-        try:
-            shutil.move(str(top), str(llama))
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
-            time.sleep(2)
-    shutil.rmtree(tmp, ignore_errors=True)
-    z.unlink(missing_ok=True)
-    z.with_name(z.name + ".done").unlink(missing_ok=True)
-    return llama
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as e:
+        fail(f"could not verify the pinned llama.cpp source ({e})",
+             "check the connection and committed engine-artifacts.json, then rerun setup; "
+             "existing source files were preserved")
 
 
 def req_name(line: str) -> str:
@@ -1660,6 +2042,8 @@ def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict
             hip_engine = False
         if not probe.exists() or not hip_engine:
             return None
+        if not is_local_engine(read_engine_meta(probe.parent)) and not installed_prebuilt_verified(probe.parent):
+            return None                                # discovery must not execute a legacy/unverified download
         try:
             hip_runtime_beside_exe(probe.parent)       # #468 #461: not the driver's System32 copy
             env = dict(os.environ)                     # the ready-made engine's ROCm DLLs (rocm/bin beside it)
@@ -1757,72 +2141,8 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
 
 
 def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
-    """The ready-made Windows HIP engine (WIN_HIP_ASSET) in engine/, kept between runs; None when it cannot be had
-    (not published for this version, no internet) or has no code for the card."""
-    eng = ROOT / "engine"
-    info = eng / "BUILD.json"
-    if info.exists() and (eng / EXE).exists():
-        try:
-            meta = json.loads(info.read_text())
-        except ValueError:
-            meta = {}
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("backend") == "hip" and meta.get("source") == "prebuilt" and ver >= WIN_HIP_MIN_ENGINE and \
-                gpu["arch"] in meta.get("archs", []) and not updating:
-            ok("ready-made AMD engine already installed")
-            return eng
-    if not url_base:
-        return None
-    eng.mkdir(exist_ok=True)
-    z = eng / WIN_HIP_ASSET
-    bases = prebuilt_bases(url_base)
-    for i, base in enumerate(bases):
-        if not base.startswith(("http://", "https://")):
-            break
-        try:
-            req = urllib.request.Request(base + WIN_HIP_ASSET, method="HEAD", headers={"User-Agent": "strata-setup"})
-            urllib.request.urlopen(req, timeout=60).close()
-            break
-        except OSError as e:
-            if i + 1 < len(bases):
-                say(f"  No ready-made AMD engine for v{source_version()} ({e}): the latest release instead")
-                continue
-            warn(f"no ready-made AMD engine at {base} ({e})")
-            return None
-    say("  Downloading the ready-made Strata engine for AMD GPUs (with the ROCm libraries it uses) ...")
-    download(base + WIN_HIP_ASSET, z, "Strata AMD engine")
-    tmp = eng / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
-    try:
-        meta = json.loads((tmp / "BUILD.json").read_text())
-    except (OSError, ValueError):
-        meta = {}
-    ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-    why = None
-    if meta.get("backend") != "hip" or not (tmp / EXE).exists():
-        why = "it is not a HIP engine"
-    elif ver < WIN_HIP_MIN_ENGINE:
-        why = f"it is version {meta.get('version')}; this setup needs {'.'.join(map(str, WIN_HIP_MIN_ENGINE))}"
-    elif gpu["arch"] not in meta.get("archs", []):
-        why = f"it is built for {', '.join(meta.get('archs', []))}; your GPU is {gpu['arch']}"
-    if why:
-        warn(f"the ready-made AMD engine at {base} cannot be used: {why}")
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        return None
-    for p in tmp.iterdir():
-        dst = eng / p.name
-        if dst.exists():
-            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        p.replace(dst)
-    shutil.rmtree(tmp, ignore_errors=True)
-    drop_archive(z)
-    hip_runtime_beside_exe(eng)                        # #468 #461
-    ok(f"ready-made AMD engine {meta.get('version', '')} for {', '.join(meta.get('archs', []))} "
-       f"(ROCm {meta.get('rocm', '?')})")
-    return eng
+    """Install only a complete, verified Windows HIP archive."""
+    return install_prebuilt(url_base, gpu, "none", updating=updating, hip=True)
 
 
 def rocm_version(root):
@@ -1928,7 +2248,13 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
     gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
     (#304): the image encoder too, for the CPU (there is no HIP encoder build yet)."""
-    eng = ROOT / "engine"
+    target = ROOT / "engine"
+    with local_build_tree(target, "local-hip") as eng:
+        _build_engine_hip(gpu, llama, vision, eng)
+    return target
+
+
+def _build_engine_hip(gpu, llama, vision, eng):
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
@@ -2010,105 +2336,104 @@ def driver_major(gpu):
 
 
 def prebuilt_bases(url_base) -> list[str]:
-    """Where to look for the ready-made engine, in order (each ending in a slash).  The default: the release of this
-    checkout's version first, then the latest (#214); an explicit --prebuilt / STRATA_PREBUILT_URL: only that."""
-    base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
-    if base != PREBUILT_URL:
-        return [base]
-    return [PREBUILT_TAG_URL.format(version=source_version()), base]
+    """One pinned default or one explicit override; no latest-release fallback."""
+    return [url_base if url_base.endswith(("/", "\\")) else url_base + "/"]
+
+
+def validate_prebuilt(eng, gpu, vision, spec, toolkit=13, hip=False):
+    meta = read_engine_meta(eng)
+    version = str(meta.get("version", ""))
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version) or version != spec.get("version") or \
+            tuple(map(int, version.split("."))) < (WIN_HIP_MIN_ENGINE if hip else MIN_ENGINE):
+        raise ArtifactError("BUILD.json version does not match a compatible trusted release")
+    if meta.get("source") not in ("prebuilt", "release"):
+        raise ArtifactError("archive is not a ready-made engine")
+    if (meta.get("backend") == "hip") != hip or meta.get("backend", "cuda") not in ("cuda", "hip"):
+        raise ArtifactError("archive has the wrong engine backend")
+    archs = meta.get("archs")
+    if not isinstance(archs, list) or not archs or type(meta.get("ptx", False)) is not bool:
+        raise ArtifactError("BUILD.json has no valid GPU architectures")
+    if hip:
+        if any(not isinstance(a, str) or not re.fullmatch(r"gfx[0-9a-f]+", a) for a in archs) or \
+                any(a not in archs for a in gpu.get("archs", [gpu["arch"]])):
+            raise ArtifactError("ready-made HIP engine does not support the selected GPU")
+    else:
+        if any(type(a) is not int or a <= 0 for a in archs) or any(
+                int(a) not in archs and not (meta.get("ptx") and int(a) > max(archs))
+                for a in gpu.get("archs", [gpu["arch"]])):
+            raise ArtifactError("ready-made CUDA engine does not support the selected GPU")
+        if str(meta.get("cuda", "")).split(".")[0] != str(toolkit):
+            raise ArtifactError("ready-made CUDA engine uses a different toolkit")
+    for key in ("lib_dirs", "cuda_dirs"):
+        dirs = meta.get(key, [])
+        if not isinstance(dirs, list) or any(not isinstance(d, str) for d in dirs):
+            raise ArtifactError(f"invalid {key} in BUILD.json")
+        for d in dirs:
+            archive_path(d)
+            if not (eng / d).is_dir():
+                raise ArtifactError(f"missing library directory: {d}")
+    required = [EXE] + ([VEXE] if vision != "none" else [])
+    if hip:
+        required.append("strata-device.exe" if WIN else "strata-device")
+    if any(not (eng / name).is_file() or (eng / name).stat().st_size == 0 for name in required):
+        raise ArtifactError("ready-made archive is missing a required engine executable")
+    return meta
+
+
+def install_prebuilt(url_base, gpu, vision, *, updating=False, toolkit=13, hip=False):
+    eng = ROOT / "engine" if hip else engine_dir(toolkit)
+    asset = WIN_HIP_ASSET if hip else CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
+    # Local compilation remains supported. A downloaded BUILD.json cannot select this path at installation.
+    if is_local_engine(read_engine_meta(eng)):
+        return None
+    custom = bool(url_base) and prebuilt_bases(url_base)[0] != PREBUILT_URL
+    try:
+        if installed_prebuilt_verified(eng) and not updating:
+            receipt = json.loads((eng / ".artifact.json").read_text())
+            spec = artifact_spec(receipt["asset"], custom=bool(receipt.get("custom")))
+            if receipt["asset"] == asset:
+                validate_prebuilt(eng, gpu, vision, spec, toolkit, hip)
+                ok("verified ready-made engine already installed")
+                return eng
+        if not url_base:
+            return None
+        # No Linux assets were published for the reviewed release. Its normal path compiles verified source.
+        if not WIN and not custom:
+            return None
+        spec = artifact_spec(asset, custom=custom)
+        base = prebuilt_bases(url_base)[0]
+        say("  Downloading the pinned, verified Strata engine ...")
+        archive = download_artifact(base + asset, asset, spec)
+        eng.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="_engine-", dir=eng.parent) as staging:
+            staged = Path(staging) / "engine"
+            staged.mkdir()
+            with zipfile.ZipFile(archive) as z:
+                extract_artifact(z, staged)
+            meta = validate_prebuilt(staged, gpu, vision, spec, toolkit, hip)
+            if hip:
+                hip_runtime_beside_exe(staged)
+            if not WIN:
+                for name in (EXE, VEXE, "strata-device"):
+                    if (staged / name).exists():
+                        (staged / name).chmod(0o755)
+            (staged / ".artifact.json").write_text(json.dumps({"asset": asset, "sha256": spec["sha256"],
+                                                              "custom": custom}), encoding="utf-8")
+            replace_artifact_tree(staged, eng)
+        ok(f"verified ready-made engine {meta['version']} installed")
+        return eng
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, RuntimeError) as e:
+        warn(f"ready-made engine was not activated ({e}); previous engine files were preserved")
+        return None
 
 
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
-    """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
-    updating: called to replace an installed engine, which starts instead when this fails (no compile).
-    toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
-    eng = engine_dir(toolkit)
-    asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
-    info = eng / "BUILD.json"
-    if info.exists() and (eng / EXE).exists() and json.loads(info.read_text()).get("backend") != "hip":
-        meta = json.loads(info.read_text())
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("source") == "local":              # compiled here: build_engine checks its source and cards
-            return None
-        have = [int(a) for a in meta.get("archs", [])]
-        miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
-                if have and int(x) not in have and not (meta.get("ptx") and int(x) > max(have))]
-        if miss:                                       # a card it has no code for (#128): compiled here instead
-            warn(f"the installed engine is built for {', '.join(str(a) for a in have)}; your GPU is "
-                 f"{', '.join(str(x) for x in miss)}: compiling instead")
-            return None
-        if ver >= MIN_ENGINE:
-            ok("ready-made engine already installed")
-            return eng
-        say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
-        info.unlink()
-    if not url_base:
-        return None
-    eng.mkdir(exist_ok=True)
-    z = eng / asset
-    bases = prebuilt_bases(url_base)
-    for i, base in enumerate(bases):
-        if not base.startswith(("http://", "https://")):
-            break
-        try:                                           # not published (yet), or no internet: compile instead
-            req = urllib.request.Request(base + asset, method="HEAD", headers={"User-Agent": "strata-setup"})
-            urllib.request.urlopen(req, timeout=60).close()
-            break
-        except OSError as e:
-            if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
-                say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
-                continue
-            warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
-            return None
-    say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
-    download(base + asset, z, "Strata engine")
-    tmp = eng / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
-    meta = json.loads((tmp / "BUILD.json").read_text())
-    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit()) < MIN_ENGINE:
-        need = ".".join(map(str, MIN_ENGINE))
-        if updating:                                   # these files are newer than the published release (#58)
-            warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
-                 f"in a few minutes to update it")
-        else:
-            warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
-                 f"{need}: compiling instead")
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        return None
-    archs = [int(a) for a in meta.get("archs", [])]
-    miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
-            if int(x) not in archs and not (meta.get("ptx") and int(x) > max(archs))]
-    if miss:
-        warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is "
-             f"{', '.join(str(x) for x in miss)}" + ("" if updating else ": compiling instead"))
-        shutil.rmtree(tmp, ignore_errors=True)
-        drop_archive(z)
-        return None
-    for p in tmp.iterdir():
-        dst = eng / p.name
-        if dst.exists():
-            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        p.replace(dst)
-    shutil.rmtree(tmp, ignore_errors=True)
-    drop_archive(z)
-    if not (eng / EXE).exists():
-        fail("the ready-made engine archive has no " + EXE)
-    if not WIN:
-        for x in (EXE, VEXE):
-            if (eng / x).exists():
-                (eng / x).chmod(0o755)
-    ok(f"ready-made engine {meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
-       f"{meta.get('cuda', '?')})")
-    return eng
+    return install_prebuilt(url_base, gpu, vision, updating=updating, toolkit=toolkit)
 
 
 def update_installed_engine(url_base, toolkit=None) -> None:
-    """An installed ready-made engine older than MIN_ENGINE is replaced before the model starts, so a plain
-    START-HERE.bat on an existing install picks up a new release.  If that cannot happen (no internet, the model
-    still running, no ready-made engine for this GPU) the installed engine is kept and starts as before.
+    """Verify installed downloads before use; replace legacy/old builds from the pinned release.
+    Failed updates preserve files, but only a previously verified engine or a local build may still start.
     toolkit None: engine/, then the experimental CUDA 12 engine in engine-cuda12/ when one is installed."""
     if toolkit is None:
         update_installed_engine(url_base, 13)
@@ -2119,11 +2444,11 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     info = eng / "BUILD.json"
     if not info.exists() or not (eng / EXE).exists():
         return
-    meta_text = info.read_text()
-    meta = json.loads(meta_text)
+    meta = read_engine_meta(eng)
+    verified = installed_prebuilt_verified(eng) if not is_local_engine(meta) else False
     if meta.get("backend") == "hip" and WIN:           # AMD on Windows: the ready-made HIP engine, when older
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-        if meta.get("source") == "prebuilt" and ver < WIN_HIP_MIN_ENGINE:
+        if not is_local_engine(meta) and (not verified or ver < WIN_HIP_MIN_ENGINE):
             try:
                 g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
                 if g is None:
@@ -2134,7 +2459,9 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                     raise RuntimeError("not published yet")
             except (Exception, SystemExit) as e:
                 warn(f"could not update the AMD engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
-                     "starting the installed one")
+                     "the previous files were preserved")
+            if not verified:
+                require_verified_engine(eng / EXE)
         return
     if meta.get("backend") == "hip":                   # AMD: compiled here, again when its source changed
         if meta.get("src") != source_hash(ENGINE_SOURCES):
@@ -2151,13 +2478,13 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                      "starting the installed one")
         return
     ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-    local = meta.get("source") == "local"
+    local = is_local_engine(meta)
     vision = meta.get("vision") or "none"
     if local:                                          # compiled here: is it older than the source (a git pull)?
         if meta.get("src") == source_hash(ENGINE_SOURCES) and \
                 (vision == "none" or meta.get("vision_src") == source_hash(VISION_SOURCES)):
             return
-    elif ver >= MIN_ENGINE:
+    elif verified and ver >= MIN_ENGINE:
         return
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         for x in (EXE, VEXE):
@@ -2189,9 +2516,9 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         except Exception as e:                         # a failed download must not stop the model from starting
             warn(f"updating the engine failed ({e})")
     if new is None:
-        if not info.exists():
-            info.write_text(meta_text)                 # get_prebuilt drops it before downloading: put it back
-        warn(f"could not update the engine: starting the installed {meta.get('version')}")
+        if not verified:
+            require_verified_engine(eng / EXE)
+        warn(f"could not update the engine: starting the verified installed {meta.get('version')}")
         return
     pip_cuda_libs(toolkit)
 
@@ -2326,6 +2653,29 @@ def isa_floor_defs(floor: str, bdir: Path, meta: dict) -> list:
     return [f"-DSTRATA_ISA_FLOOR={floor}"] if floor else []
 
 
+def model_engine_requirements(cfg: dict) -> set[str]:
+    """Capabilities of the model, retained even when an older config has no explicit requirement field."""
+    requirements = set(cfg.get("engine_requirements") or [])
+    choice = config_model_choice(cfg)
+    if choice and choice[0] == "orca" and model_profile(choice[1], choice[0]).get("source_engine"):
+        requirements.add(ORCA_ENGINE_REQUIREMENT)
+    return requirements
+
+
+def require_model_engine(cfg: dict) -> None:
+    """The pinned prebuilt lacks these kernels; a current local source build is required until a reviewed release."""
+    requirements = model_engine_requirements(cfg)
+    if not requirements:
+        return
+    if requirements - {ORCA_ENGINE_REQUIREMENT}:
+        fail("this model requires engine capabilities this installer does not recognize",
+             "update Strata and run setup again")
+    meta = read_engine_meta(Path(cfg["exe"]).parent)
+    if not is_local_engine(meta) or meta.get("src") != source_hash(ENGINE_SOURCES):
+        fail("this Orca quant requires an engine compiled from the current source (Q2_K / Q3_K / Q6_K kernels)",
+             "run setup again with --setup --build; the pinned v0.1.39 engine cannot run this quant")
+
+
 def engine_defs(archs, toolkit=13) -> list:
     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75, and
     for every CUDA 12 engine (the same build as the ready-made CUDA 12 one: it admits the older cards)."""
@@ -2353,13 +2703,19 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     engine-cuda12/ with its own build folders."""
     if toolkit is None:
         toolkit = 12 if min(int(x) for x in gpu.get("archs", [gpu["arch"]])) < CUDA13_MIN_ARCH else 13
+    target = engine_dir(toolkit)
+    with local_build_tree(target, "local") as eng:
+        _build_engine(gpu, vision, yes, llama, toolkit, eng)
+    return target
+
+
+def _build_engine(gpu, vision, yes, llama, toolkit, eng):
     t12 = int(toolkit) == 12
-    eng = engine_dir(toolkit)
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
     want_vision = vision != "none"
-    local = meta.get("source") == "local"
+    local = is_local_engine(meta)
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
     archs = sorted({int(x) for x in gpu.get("archs", [gpu["arch"]])})    # every card the model runs on
     built = {int(x) for x in meta.get("archs", [])}
@@ -2369,7 +2725,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
         (meta.get("isa_floor") or "") == floor
-    vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
+    vision_ok = not want_vision or (local and (eng / VEXE).exists() and meta.get("vision_src") == vsrc)
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
@@ -2509,15 +2865,24 @@ def low_ram_together(a, model, ram, gpu, chosen) -> bool:
     return False
 
 
-def unsloth_together(a, model, ram, gpu, chosen) -> bool:
+def unsloth_together(a, model, ram, gpu, chosen, family=None) -> bool:
     """#498: UD-Q4_K_XL with several GPUs chosen.  Its RAM budget (--resident-budget-gib) has no layer split, so a
     split runs without it: all its experts loaded into RAM from the GGUFs at start, as with the 2-3-bit models - only
     where the RAM holds the GGUF files and 24 GB more (unsloth_split_need_gb; 165 GiB, 2x RTX 3090: 31 -> 64-78
     tok/s).  An explicit --gpus is honoured there; otherwise asked, one GPU by default (--yes: one GPU, as before); an
-    explicit --resident-budget-gib keeps one GPU.  True: all of them."""
+    explicit --resident-budget-gib keeps one GPU unless --gpus also asks for an incompatible split. True: all of them."""
     names = " + ".join(gpu_name(g) for g in chosen)
-    need = unsloth_split_need_gb(model)
+    need = unsloth_split_need_gb(model, family)
+    if a.gpus and a.resident_budget_gib is not None:
+        fail(f"--resident-budget-gib has no layer split: it cannot be combined with --gpus for {model}",
+             f"use --gpu {gpu['index']} with the RAM budget, or leave out --resident-budget-gib to use the GPUs "
+             f"together (needs ~{need:.0f} GB of RAM)")
     if ram < need:
+        if a.gpus:
+            fail(f"{model} cannot share its RAM budget across GPUs (the engine has no layer split with it), and "
+                 f"without the budget it needs ~{need:.0f} GB of RAM (its GGUF files and {UNSLOTH_RAM_LEFT_GB} GB "
+                 f"more); this PC has {ram:.0f} GB",
+                 f"use --gpu {gpu['index']} for one GPU with a RAM budget, or choose a smaller model for --gpus")
         warn(f"{model} runs on one GPU here: on several it has no RAM budget and needs ~{need:.0f} GB of RAM (its GGUF "
              f"files and {UNSLOTH_RAM_LEFT_GB} GB more), this PC has {ram:.0f} - using {gpu_name(gpu)} only")
         return False
@@ -2525,7 +2890,7 @@ def unsloth_together(a, model, ram, gpu, chosen) -> bool:
         warn(f"--resident-budget-gib has no layer split: {model} runs on one GPU with it - using {gpu_name(gpu)} only "
              f"(leave the budget out to use {names} together)")
         return False
-    arena = (f"up to {MODELS[model]['arena_gb']:.0f} GB, conservative bound" if model == "Q4_K_M" else
+    arena = (f"up to {model_profile(model, family)['arena_gb']:.0f} GB, conservative bound" if family == "orca" else
              f"~{MODELS[model]['arena_gb']:.0f} GB")
     note = (f"no RAM budget - all of its experts ({arena}) are loaded into RAM from the "
             f"model files at start, and the files pass through the OS file cache (needs ~{need:.0f} GB of RAM, this "
@@ -2537,9 +2902,9 @@ def unsloth_together(a, model, ram, gpu, chosen) -> bool:
         say()
         say(f"  {model} can run on one GPU with a RAM budget of its experts, or on {names} together without one:")
         say(f"  1) {gpu_name(gpu)} only: the most-used experts kept in RAM, the rest read from the SSD   (recommended: "
-            + ("conservative starting point)" if model == "Q4_K_M" else "the tested setup)"))
+            + ("conservative starting point)" if family == "orca" else "the tested setup)"))
         say(f"  2) {names} together: {note};")
-        say("     Orca Q4_K_M multi-GPU performance has not been measured here" if model == "Q4_K_M" else
+        say(f"     Orca {model} multi-GPU performance has not been measured here" if family == "orca" else
             "     about twice as fast in #498 (2x RTX 3090: 31 -> 64-78 tokens/s)")
         if ask(f"{model}: which GPUs?", ["1", "2"], "1", a.yes) == "2":
             ok(f"{model} on {names}: {note}")
@@ -2580,19 +2945,19 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
                                                                           " (--model)" if explicit_model else ""))
 
 
-def ctx_ram_need(model, ctx, low_ram=False):
+def ctx_ram_need(model, ctx, low_ram=False, family=None):
     """#406: the RAM (GB) setup estimates for a long context with IQ3_XXS / IQ3_S: their experts + the context's
     8-bit KV cache + 24 GB of room for everything else (the 0.1.29 arithmetic, counted).  None where the context does
     not count against RAM by this rule: the other sizes, and the low-RAM mode (its KV cache stays in VRAM)."""
-    if model not in ("IQ3_XXS", "IQ3_S") or low_ram:
+    if model not in ("IQ3_XXS", "IQ3_S") or low_ram or model_profile(model, family).get("budget"):
         return None
     return MODELS[model]["arena_gb"] + ctx * 13 * 1056 / 1e9 + 24
 
 
-def ram_ctx(model, ram, low_ram=False) -> int:
+def ram_ctx(model, ram, low_ram=False, family=None) -> int:
     """#406: the longest context the RAM rule recommends: 128K, or longer where the estimate fits this PC's RAM.  It
     is part of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note."""
-    return max(c for c in CONTEXTS if c <= 131072 or (ctx_ram_need(model, c, low_ram) or 0) <= ram)
+    return max(c for c in CONTEXTS if c <= 131072 or (ctx_ram_need(model, c, low_ram, family) or 0) <= ram)
 
 
 def settings_path() -> Path:
@@ -2770,7 +3135,8 @@ def write_config(path: Path, cfg: dict):
 # #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the user's - a
 # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
-                        "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
+                        "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision",
+                        "engine_requirements"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN"})   # the "env" entries setup writes
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
@@ -2880,14 +3246,14 @@ def choices_from_config(cfg_path: Path) -> dict:
     tag = cfg_path.stem[len("strata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
-    if model not in MODELS:                            # (sizes have no dash except UD-Q4_K_XL: the old rule)
+    if model not in family_models(family):
         model = tag.split("-")[-1].upper()
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
     esp = val("--control-vector-scaled")
     esp_path = esp.rsplit(":", 1)[0] if esp else None
-    return {"family": family, "model": model if model in MODELS else None,
+    return {"family": family, "model": model if model in family_models(family) else None,
             "context": int(val("--max-context")) if val("--max-context") else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
@@ -3017,6 +3383,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     sys.path.insert(0, str(ROOT / "tools"))
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    require_verified_engine(cfg["exe"])
+    require_model_engine(cfg)
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads). It takes about 5-10 minutes; the PC is busy meanwhile.")
@@ -3104,6 +3472,7 @@ def update_install(have: list, a) -> int:
         update_installed_engine(a.prebuilt)
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+        require_model_engine(cfg)
         if "--mtp" in cfg["args"][:-1]:
             refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
         if cfg.get("backend") == "hip" and WIN:
@@ -3146,6 +3515,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    require_verified_engine(cfg["exe"])
+    require_model_engine(cfg)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -3473,6 +3844,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
         return use_cuda12(cards, cfg_path, cfg, yes)
     missing = [g for g in cards if not (engine_runs_on(g) if tk == 13 else engine_runs_on(g, tk))]
     if not missing:
+        require_model_engine(cfg)
         return cfg
     eng = engine_dir(tk)
     info = eng / "BUILD.json"
@@ -3486,6 +3858,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk)
     dirs = json.loads(info.read_text()).get("cuda_dirs") or []
     cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
+    require_model_engine(cfg)
     write_config(cfg_path, cfg)
     return cfg
 
@@ -3517,10 +3890,12 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     main = gpu_info(cards[0]["index"]) or cards[0]
     vision = "gpu" if cfg.get("vision") else "none"
     eng = get_cuda12_engine(os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
-                            {**main, "archs": sorted({int(g["arch"]) for g in cards})}, vision, yes)
+                            {**main, "archs": sorted({int(g["arch"]) for g in cards})}, vision, yes,
+                            **({"build": True} if model_engine_requirements(cfg) else {}))
     cfg["exe"] = str(eng / EXE)
     cfg["cuda"] = 12
     cfg["lib_dirs"] = engine_lib_dirs(eng, 12)
+    require_model_engine(cfg)
     if cfg.get("vision") and (eng / VEXE).exists():
         cfg["vision"]["exe"] = str(eng / VEXE)
     write_config(cfg_path, cfg)
@@ -3529,17 +3904,25 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
 
 
 def write_run_script(model, cfg_path, port, open_browser=True):
-    """run-<model>.bat / .sh: the server with this config; `open_browser` False (#609: --no-browser) leaves --open out."""
+    """run-<model>.bat / .sh: the server with this config; source-only quants check their engine before launch."""
     serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
              "--port", str(port)] + (["--open"] if open_browser else [])
+    cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig")) if Path(cfg_path).exists() else {}
+    preflight = ""
+    if model_engine_requirements(cfg):
+        check = [sys.executable, "-c",
+                 "import json,runpy,sys; runpy.run_path(sys.argv[1])['require_model_engine']"
+                 "(json.load(open(sys.argv[2],encoding='utf-8-sig')))", str(ROOT / "setup.py"), str(cfg_path)]
+        preflight = " ".join(f'"{x}"' for x in check)
+        preflight += "\r\nif errorlevel 1 (\r\n  pause\r\n  exit /b 1\r\n)\r\n" if WIN else " || exit $?\n"
     if WIN:
         script = ROOT / f"run-{model.lower()}.bat"
         script.write_text("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
-                          " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n", encoding="utf-8")
+                          preflight + " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n", encoding="utf-8")
     else:
         script = ROOT / f"run-{model.lower()}.sh"
-        script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n",
-                          encoding="utf-8")
+        script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\n" + preflight + "exec " +
+                          " ".join(f'"{x}"' for x in serve) + "\n", encoding="utf-8")
         script.chmod(0o755)
     return script
 
@@ -3611,7 +3994,7 @@ def sycl_setup(argv) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES),
-                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, orca = OrcaRouter Uncensored Q4_K_M")
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, orca = OrcaRouter Uncensored (all published quants)")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -3634,9 +4017,10 @@ def main() -> int:
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
-    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (default: asked when several can be "
+    gpu_flags = ap.add_mutually_exclusive_group()
+    gpu_flags.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (default: asked when several can be "
                                   "used; with --setup it is saved, when starting it is for that start only)")
-    ap.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them (AMD: as setup lists "
+    gpu_flags.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them (AMD: as setup lists "
                                    "them): \"0,2\", or \"all\" (every card that can); the first is the main one. "
                                    "Saved, also when starting (see docs/MULTI_GPU.md)")
     ap.add_argument("--layer-split", help="with --gpus: where each later GPU's layers start (\"18\", \"16,32\"), one "
@@ -3670,6 +4054,9 @@ def main() -> int:
                          "Volta). 12 also runs with an older driver (Windows 528+, Linux 525+). docs/OLDER_GPUS.md")
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
+    ap.add_argument("--artifact-manifest", default=None,
+                    help="trusted local size/SHA-256 JSON for an explicit --prebuilt override; "
+                         "also STRATA_ARTIFACT_MANIFEST (docs/ENGINE_DOWNLOAD_SECURITY.md)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
@@ -3684,7 +4071,7 @@ def main() -> int:
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS, Q4_K_M: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
+                    help="UD-Q4_K_XL, UD-IQ4_XS and Orca quants: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
                          "more is kept as you choose, with a note)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
@@ -3701,6 +4088,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    global ARTIFACT_MANIFEST_OVERRIDE
+    ARTIFACT_MANIFEST_OVERRIDE = a.artifact_manifest
     if a.backend == "sycl":                            # Intel Arc: the SYCL port's own setup (sycl/setup_intel.py)
         return sycl_setup(sys.argv[1:])
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
@@ -3916,11 +4305,11 @@ def main() -> int:
         a.build = True
     if a.check:
         say()
-        for m, d in MODELS.items():
+        for m, d in (family_models(a.family) if a.family else MODELS).items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             if d.get("budget"):
                 verdict = (("EXPERIMENTAL, " if d.get("experimental") else "") +
-                           f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest "
+                           f"fits with {resident_budget_gib(m, ram, family=a.family)} GiB of its experts in RAM, the rest "
                            "read from the SSD" if ram >= d["ram_gb"] else "does not fit")
                 if hip:                                # #429: not run on AMD yet (its prompt kernels are CUDA-only)
                     verdict += " - NVIDIA only so far, untested on AMD"
@@ -3928,7 +4317,9 @@ def main() -> int:
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}% "
                            "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"])
                                                  else "the rest is read from the SSD as needed)"))
-            say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
+            planning = (f"{d['ram_gb']} GB RAM planning threshold (unmeasured)" if a.family == "orca" else
+                        f"needs ~{d['ram_gb']} GB RAM")
+            say(f"  {m:8s} {planning}: {verdict}")
         say("\nThis PC can run Strata. Run it again without --check to install.")
         return 0
 
@@ -3947,38 +4338,49 @@ def main() -> int:
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     say()
-    names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
-    names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
+    profiles = family_models(family)
+    names = list(profiles)
+    names.sort(key=lambda m: bool(profiles[m].get("experimental")))   # an experimental size last, never the default
     if a.model and a.model not in names:
         # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
-        elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
+        elsewhere_fams = [f for f in FAMILIES if a.model in family_models(f)]
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names)
              + (f" (or {a.model}: " + ", ".join(f"--family {f} --model {a.model}" for f in elsewhere_fams) + ")"
                 if elsewhere_fams else "")
              + (f".\n       {SUPPORTED_GGUFS}" if a.gguf_dir else ""))
     for i, m in enumerate(names, 1):
-        d = MODELS[m]
-        fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
+        d = profiles[m]
+        fit = "" if ram >= d["ram_gb"] else (f"   <- below {d['ram_gb']} GB RAM planning threshold; you have {ram:.0f}"
+                                                   if family == "orca" else
+                                                   f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}")
         if d.get("budget"):
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
-                f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
+                f"{resident_budget_gib(m, ram, family=family)} GiB in RAM"
+                + (f" (arena upper bound {d['arena_gb']:.1f} GB; 48 GB RAM planning threshold, unmeasured)"
+                   if family == "orca" else f" of its {d['arena_gb']:.0f} GB of experts") + fit)
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+    rec_model = fam.get("default_model") or ("IQ3_XXS" if ram >= 60 and "IQ3_XXS" in names else names[0])
+    rec = str(names.index(rec_model) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
+    profile = profiles[model]
+    if hip and WIN and profile.get("source_engine"):
+        fail(f"Orca {model} needs new kernels that this installer cannot yet build for Windows AMD",
+             "use a local NVIDIA source build or Linux HIP for this quant; the pinned Windows HIP engine "
+             "does not contain these kernels")
     budget, q4_split = None, False
-    if MODELS[model].get("budget"):
+    if profile.get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split) unless
         # the RAM holds the GGUFs and 24 GB more: then several, without the budget, if asked for (#498)
-        if MODELS[model].get("experimental"):
-            warn(MODELS[model].get("experimental_note") or
+        if profile.get("experimental"):
+            warn(profile.get("experimental_note") or
                  f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
                  "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
-        if hip and MODELS[model].get("nvidia_only"):
+        if hip and profile.get("nvidia_only"):
             # #429 (jkuepker): checked before the 111 GB download.  The HIP engine has no prompt kernels for its
             # Q4_K / Q5_K experts (STRATA_MMQ_KQUANTS is CUDA-only) and it has not been run on AMD: asked, not refused
             confirm_risk(f"{model} has not been run on AMD cards yet: its prompt kernels are NVIDIA-only, so on "
@@ -3986,16 +4388,17 @@ def main() -> int:
                          bool(a.model), a.yes, f"{model} is NVIDIA-only so far", "choose one of the 2-3-bit models, "
                          f"or --model {model} --yes to try it on AMD anyway", "  Try it anyway?")
             warn(f"installing {model} on an AMD card, as you chose (please report how it runs)")
-        if ram < MODELS[model]["ram_gb"]:
-            confirm_risk(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB: "
-                         f"its RAM budget would be {resident_budget_gib(model, ram)} GiB, so nearly every expert is "
+        if ram < profile["ram_gb"]:
+            ram_note = (f"{model}'s inherited RAM planning threshold is {profile['ram_gb']} GB (unmeasured)"
+                        if family == "orca" else f"{model} needs {profile['ram_gb']} GB of RAM or more")
+            confirm_risk(f"{ram_note}; this PC has {ram:.0f} GB: "
+                         f"its RAM budget would be {resident_budget_gib(model, ram, family=family)} GiB, so nearly every expert is "
                          "read from the SSD while it answers (very slow), and it may run out of RAM",
-                         bool(a.model), a.yes, f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC "
-                         f"has {ram:.0f} GB", f"choose one of the 2-3-bit models, or --model {model} --yes to "
+                         bool(a.model), a.yes, f"{ram_note}; this PC has {ram:.0f} GB", f"choose one of the 2-3-bit models, or --model {model} --yes to "
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
-        budget = budget_choice(model, ram, a.resident_budget_gib)
-        if multi and not unsloth_together(a, model, ram, gpu, chosen):
+        budget = budget_choice(model, ram, a.resident_budget_gib, family)
+        if multi and not unsloth_together(a, model, ram, gpu, chosen, family):
             multi, sel, chosen = [], [gpu["index"]], [gpu]
         q4_split = bool(multi)                         # #498: on several GPUs without the RAM budget
         if not q4_split:
@@ -4003,14 +4406,14 @@ def main() -> int:
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
-        warn(f"--resident-budget-gib is for UD-Q4_K_XL, UD-IQ4_XS and Q4_K_M: {model} keeps all of its experts in RAM or in "
+        warn(f"--resident-budget-gib is for UD-Q4_K_XL, UD-IQ4_XS and Orca quants: {model} keeps all of its experts in RAM or in "
              "the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
     if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
         multi, sel, chosen = [], [gpu["index"]], [gpu]
     # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
-    if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
+    if not low_ram and budget is None and ram < profile["ram_gb"] - 4:
         confirm_paging(model, ram, a.low_ram, a.yes, bool(a.model))
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
@@ -4019,7 +4422,7 @@ def main() -> int:
     if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
         rec_ctx = 8192 if small < 14 else 32768
     # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
-    rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
+    rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram, family))
     if a.context:
         ctx = a.context
     else:
@@ -4027,7 +4430,7 @@ def main() -> int:
         say("  Context length = how much text the model can see at once (your chat, files, tool output).")
         say("  Longer needs more VRAM for it, so fewer experts fit on the GPU:")
         for i, c in enumerate(CONTEXTS, 1):
-            need_c = ctx_ram_need(model, c, low_ram)
+            need_c = ctx_ram_need(model, c, low_ram, family)
             note = ("   (recommended for your GPU)" if c == rec_ctx else "") + \
                    ("   (experimental: setup adds rope scaling)" if c > 262144 else "") + \
                    (f"   (needs ~{need_c:.0f} GB RAM, this PC has {ram:.0f}: may run out of memory)"
@@ -4037,10 +4440,10 @@ def main() -> int:
                                str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
     # #406 #364: a context past the RAM rule (an explicit --context, a pick in the list, or the earlier install's) is
     # kept, with what it risks.  It used to become 128K: users ran 256K fine where setup's estimate said no.
-    need_gb = ctx_ram_need(model, ctx, low_ram)
+    need_gb = ctx_ram_need(model, ctx, low_ram, family)
     if need_gb is not None and ram < need_gb and ctx > 131072:
         warn(f"{ctx // 1024}K with {model} needs ~{need_gb:.0f} GB of RAM by setup's estimate "
-             f"({MODELS[model]['arena_gb']:.0f} GB of experts + the context + room for the rest); this PC has "
+             f"({profile['arena_gb']:.0f} GB of experts + the context + room for the rest); this PC has "
              f"{ram:.0f}. Kept as you chose: it may be slower or run out of RAM under load. {rec_ctx // 1024}K is the "
              "recommended size.")
     scaling = a.rope_scaling
@@ -4073,7 +4476,7 @@ def main() -> int:
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
         ok(f"KV cache: {'8-bit' if kv == 'int8' else '4-bit (Hadamard-rotated)'}")
-    if MODELS[model].get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
+    if profile.get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
         vision = "none"
         if a.vision not in (None, "no", "none"):
             warn(f"images are not available with {model} yet: off")
@@ -4094,7 +4497,7 @@ def main() -> int:
     # The GPU's share: its VRAM less the dense weights and buffers, this context's KV cache and the image encoder's room.
     resident = False
     if low_ram:
-        arena = MODELS[model]["arena_gb"]
+        arena = profile["arena_gb"]
         vram = gpu["vram_gb"] - (VISION[vision]["reserve_mib"] / 1024 if vision != "none" else 0)
         share = low_ram_gpu_share(model, vram, ctx, kv)
         rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
@@ -4158,10 +4561,10 @@ def main() -> int:
     # #425 (jctaborda): a download that resumes needs room only for what is still missing - the finished shards and
     # the .part files already on the disk count
     on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
-    to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
+    to_fetch = 0 if a.gguf_dir or have_model else max(profile["download_gb"] - on_disk, 0)
     need = to_fetch + 8 + \
         (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0) + \
-        (MODELS[model]["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and avx512 and family == "qwen") else 0)
+        (profile["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and avx512 and family == "qwen") else 0)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
              (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""),
@@ -4174,6 +4577,10 @@ def main() -> int:
 
     # ---- 4. the engine
     step(4, "the Strata engine")
+    if profile.get("source_engine"):
+        a.build = True
+        warn(f"Orca {model} requires the added expert kernels: compiling this checkout locally; "
+             "the pinned v0.1.39 engine cannot run this quant")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
     if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
@@ -4202,14 +4609,18 @@ def main() -> int:
     else:
         lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(cuda_tk)
     engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
-    need_engine = MODELS[model].get("engine", UNSLOTH_ENGINE)
+    need_engine = profile.get("engine", UNSLOTH_ENGINE)
     if budget is not None and engine_ver < need_engine:      # checked before the 94-111 GB download
         fail(f"{model} needs engine {'.'.join(map(str, need_engine))} or newer; this one is {meta.get('version')}",
              "update Strata (or compile the engine with --build) and run setup again")
+    if profile.get("source_engine"):
+        require_model_engine({"exe": str(eng / EXE), "engine_requirements": [ORCA_ENGINE_REQUIREMENT]})
     ok(f"engine: {eng / EXE}")
 
     # ---- 5. the model files
     step(5, f"downloading {fam['title']} {model}")
+    checksums = orca_checksums(model, data / "metadata" / "orca-lfs" / HF_REVISIONS[ORCA_REPO]) \
+        if family == "orca" else fam.get("sha256", {})
     if not a.gguf_dir:
         missing = [s.name for s in shards if not (s.exists() and done(s))]
         if missing:                                    # #495: files downloaded by hand go here, or --gguf-dir
@@ -4235,8 +4646,8 @@ def main() -> int:
             download(fam["hf"].format(q=model) + s.name, s)
     check_shards(shards)
     for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256
-        if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam["sha256"][s.name])
+        if s.name in checksums:
+            verify_sha256(s, *checksums[s.name])
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():
@@ -4270,7 +4681,7 @@ def main() -> int:
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              *fam.get("pack_args", [])], env=env)
     if low_ram and not (pack / "experts.bin").exists():
-        say(f"  Writing the experts into one file for the low-RAM mode (one time, {MODELS[model]['arena_gb']:.0f} GB) ...")
+        say(f"  Writing the experts into one file for the low-RAM mode (one time, {profile['arena_gb']:.0f} GB) ...")
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              "--experts-bin"], env=env)
     ok(f"model prepared: {pack}")
@@ -4322,7 +4733,7 @@ def main() -> int:
         tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
         size = getattr(tensor, "expected_bytes", lambda: None)()
         table_gb = size / 1e9 if size else 28.8
-        if ram >= MODELS[model]["ram_gb"] + table_gb + 4:
+        if ram >= profile["ram_gb"] + table_gb + 4:
             args += ["--ple-io", "ram"]
             ok(f"the model is on a rotational disk ({disk}): its {table_gb:.0f} GB n-gram table is kept in RAM "
                "(--ple-io ram) - read from the disk at random, it can stall prompts for minutes (#605)")
@@ -4338,7 +4749,7 @@ def main() -> int:
     # decision rather than one threshold at a time - a future tier added to this chain cannot reintroduce the
     # combination the engine refuses (PR review).
     # --kv-streaming on|off overrides the RAM test (the owner's rule); k8v4 and WSL stay off - they cannot stream.
-    stream_fits = ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1
+    stream_fits = ram >= profile["ram_gb"] + kv_ram_gb + 1
     if kv == "k8v4":
         if ctx >= 65536:
             ok("KV streaming off: not supported with --kv k8v4; the KV cache stays in VRAM")
@@ -4355,19 +4766,19 @@ def main() -> int:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
         if not stream_fits:
-            warn(f"KV streaming needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
+            warn(f"KV streaming needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{profile['ram_gb']} GB {model} "
                  f"uses; this PC has {ram:.0f}. Kept as you chose (--kv-streaming on): it may page or run out of RAM "
                  "under load")
         if q4_split:                                   # #498: no budget to take it out of
             pass
         elif budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
-            budget = resident_budget_gib(model, ram, kv_ram_gb)
+            budget = resident_budget_gib(model, ram, kv_ram_gb, family)
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
-        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb):
+        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb, family):
             warn(f"the KV cache's {kv_ram_gb:.1f} GB of RAM come on top of your {budget:g} GiB RAM budget (setup "
-                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb)} GiB); kept as you chose")
+                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb, family)} GiB); kept as you chose")
     elif ctx >= 65536:   # #620: say why, so a regenerated config that lost --kv-resident is not a surprise
-        ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
+        ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{profile['ram_gb']} GB {model} "
            f"uses, and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts). --kv-streaming on "
            "turns it on anyway")
     elif a.kv_streaming == "on":
@@ -4406,6 +4817,8 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
+    if profile.get("source_engine"):
+        cfg["engine_requirements"] = [ORCA_ENGINE_REQUIREMENT]
     if cuda_tk == 12:                                  # the experimental CUDA 12 engine (engine-cuda12/)
         cfg["cuda"] = 12
     if hip:
@@ -4440,7 +4853,7 @@ def main() -> int:
         if a.parallel >= 2:
             cfg["parallel"] = a.parallel
             for i, line in enumerate(parallel_note(a.parallel, [g.get("vram_gb", 0.0) for g in chosen],
-                                                   MODELS[model]["arena_gb"], ctx, kv, streaming)):
+                                                   profile["arena_gb"], ctx, kv, streaming)):
                 (ok if i == 0 else warn)(line)
         else:
             cfg["parallel"] = 1
@@ -4485,7 +4898,7 @@ def main() -> int:
     if vision != "none":
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
     if a.parallel is None:                             # #465: the opt-in, said once (nothing changes)
-        for line in parallel_note(None, [g.get("vram_gb", 0.0) for g in chosen], MODELS[model]["arena_gb"], ctx, kv,
+        for line in parallel_note(None, [g.get("vram_gb", 0.0) for g in chosen], profile["arena_gb"], ctx, kv,
                                   "--kv-resident" in cfg["args"]):
             say("  " + line)
     if tuned is False:                                 # #447: a failed tuning is repeated here, not only above

@@ -98,13 +98,17 @@ def _has_image(content) -> bool:
 
 
 def _image_source(part: dict) -> str:
-    """An image part's source as one string: a data: URL, an http(s) URL or a local file path.
+    """An image part's source as one string; serve.image_input enforces upload and URL policy.
     OpenAI: {"type": "image_url", "image_url": {"url": ...}} (or "image_url": "..."), Responses-style
     {"type": "input_image", "image_url": ...}; Anthropic: {"type": "image", "source": {"type": "base64",
     "media_type": ..., "data": ...}} or {"source": {"type": "url", "url": ...}}."""
     if part.get("type") == "image":
         src = part.get("source") or {}
+        if not isinstance(src, dict):
+            raise ValueError("an image source must be an object")
         if src.get("type") == "base64":
+            if not isinstance(src.get("media_type", "image/png"), str) or not isinstance(src.get("data", ""), str):
+                raise ValueError("image media_type and base64 data must be strings")
             return f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"
         return src.get("url") or src.get("path") or ""
     url = part.get("image_url")

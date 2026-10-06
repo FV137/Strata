@@ -124,6 +124,24 @@ inline void dequantize_iq4_nl(const uint8_t* block, float* out) {
         out[j + 16] = d * (float)kvalues_iq4nl[qs[j] >> 4];
     }
 }
+// ---- Q2_K: 256 elements from 84 bytes: scales/mins[16], qs[64], fp16 d, fp16 dmin.
+// Transcribed from dequantize_row_q2_K (ggml-quants.c, pinned 3cf03257).
+inline void dequantize_q2_K(const uint8_t* block, float* out) {
+    const float d = fp16_to_fp32(read_u16(block + 80));
+    const float dmin = fp16_to_fp32(read_u16(block + 82));
+    const uint8_t* q = block + 16;
+    int is = 0;
+    for (int n = 0; n < 256; n += 128) {
+        for (int shift = 0; shift < 8; shift += 2) {
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t sc = block[is++];
+                const float dl = d * (sc & 15), ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *out++ = dl * ((q[16 * half + l] >> shift) & 3) - ml;
+            }
+        }
+        q += 32;
+    }
+}
 // ---- Q6_K: 256 elements from a 210-byte super-block, transcribed from dequantize_row_q6_K
 // (ggml-quants.c at 3cf03257). Layout: ql[128] low nibbles, qh[64] high 2 bits, scales[16] int8,
 // fp16 d LAST. Processed in two 128-element halves, each advancing ql by 64, qh by 32, sc by 8.

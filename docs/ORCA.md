@@ -1,5 +1,8 @@
 # OrcaRouter IQ3_XXS compatibility
 
+Historical report: the current [Orca quant installer](ORCA_QUANTS.md) now includes this quant and the other
+published choices. The scope and support limits below describe the original experiment.
+
 Validated on Linux with an RTX 5090 (32 GB), Ryzen 9 9950X3D and 128 GB RAM on 2026-09-27.
 
 The target is `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF`, **IQ3_XXS** (two shards, 85.20 GB total).

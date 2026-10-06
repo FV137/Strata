@@ -769,43 +769,48 @@ until it was started with `-c 'windows.sandbox="unelevated"'` (a Codex setting, 
 
 ## Tools from MCP servers
 
-The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers, as LM Studio and Claude
-Desktop do: reading your files, fetching web pages, searching, anything an MCP server offers. List the servers in
-`strata-<model>.json` under `"mcp_servers"` - the same shape as Claude Desktop's `mcpServers` block, which you can
-also paste as it is (key `"mcpServers"`):
+The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers. List them in
+`strata-<model>.json` under `"mcp_servers"` (the `"mcpServers"` spelling is also accepted). Each server needs an
+explicit `allowed_tools` list using its original tool names. An omitted or empty list exposes no tools:
 
 ```json
 "mcp_servers": {
-  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\me\\Documents\\notes"]},
-  "search": {"url": "http://127.0.0.1:3000/mcp", "headers": {"Authorization": "Bearer ..."}}
+  "search": {
+    "url": "http://127.0.0.1:3000/mcp",
+    "allowed_tools": ["search"],
+    "headers": {"Authorization": "Bearer ..."}
+  }
 },
 "mcp": {"timeout_s": 60, "max_result_chars": 20000, "max_rounds": 8}
 ```
 
-Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
-with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+Or keep an `mcpServers` block in a file supplied with `--mcp-config path/to/mcp.json`. Restart Strata after
+changes. Existing Claude Desktop configurations need explicit tool permissions and subprocess execution settings;
+unsupported keys fail validation. See [MCP security and migration](MCP_SECURITY.md) for full configuration and
+runnable examples.
 
-- **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
-  stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
-  servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
-  transport is not supported). `"disabled": true` leaves an entry out.
-- The servers start with Strata, in the background; the server window says what each one offers
-  (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
-  without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by
-  default). A server that stops later is started again at its next call.
-- In the chat each call shows as a small block (tool, arguments, result); the model reads the result and goes on,
-  up to `max_rounds` calls in a row per answer. A tool that fails or takes longer than `timeout_s` (default 60 s)
-  gives the model an `error: ...` result instead of ending the chat. Results longer than `max_result_chars`
-  (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
-- Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
-  before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
-  gets `strata_mcp` tool events in the stream).
+- **A program** (`command`, `args`) uses newline-delimited JSON-RPC on stdin/stdout. By default it requires Linux
+  bubblewrap: read-only system runtime, explicit app/data mounts, private home/tmp/processes/IPC, and no network.
+  Failed or unavailable sandbox startup leaves that server failed; there is no unsandboxed fallback.
+  `execution: "trusted"` deliberately permits host execution and is not sandboxed. Programs receive only a minimal
+  environment plus explicit `env`/`inherit_env` grants. Strata never installs packages for the sandbox.
+  **An address** (`url`, optional `headers`) uses Streamable HTTP; old SSE-only endpoints are unsupported.
+- Servers start in the background. The server window and Monitor tab show their state and permitted tools.
+  `"disabled": true` leaves an entry out. The Sampling drawer has **Use tools from MCP servers**. A stopped
+  server restarts at its next permitted call; permissions are checked again at invocation.
+- Each call appears in the chat with its arguments and result. The model can make up to `max_rounds` calls per
+  answer. Failures and timeouts become `error: ...` results. `max_result_chars` caps text shown to the model;
+  `max_response_bytes` separately bounds transport input before parsing (1 MiB per server by default).
+  The Stop button asks a running tool to cancel; the tool must cooperate.
+- Only the chat page uses them by default. API requests opt in with `"strata_mcp": true` and receive `strata_mcp`
+  stream events. Other clients keep their own tools.
 
-**Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
-because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders
-it needs, prefer read-only tools, and don't add servers you don't trust. The tools can only be used from the chat
-page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
-from other devices, set an API key.
+**Security.** The model decides when to call permitted tools, including in response to hostile instructions in
+files or webpages. Exact allowlists limit available operations; tool names and annotations do not prove safety.
+Keep mounted data and credentials narrow. Trusted-mode commands have the host user's rights. The Linux sandbox
+shares the host kernel and does not provide resource quotas; independently managed containers/VMs can provide a
+stronger boundary. HTTP service isolation is the administrator's responsibility. Protect MCP configuration from
+untrusted edits, and set an API key when Strata is reachable from other devices. See [MCP_SECURITY.md](MCP_SECURITY.md).
 
 **Context extension past 262K (rope scaling, EXPERIMENTAL, off unless you pick it).** The model was trained on
 262,144 positions (rotary base 1e7). Rope scaling rescales the rotation angles so that longer contexts stay usable,
@@ -910,7 +915,7 @@ you> /image C:\Users\me\Pictures\receipt.jpg
 you> What is the total on this receipt?
 ```
 
-**OpenAI API** (an `image_url` part: a `data:` URL, an `http(s)://` URL or a local file path):
+**OpenAI API** (an `image_url` part containing a base64 image `data:` URL):
 
 ```python
 import base64
@@ -923,10 +928,16 @@ r = client.chat.completions.create(model="strata", messages=[{"role": "user", "c
 print(r.choices[0].message.content)
 ```
 
-**Anthropic API:** an `image` block with a `base64` (or `url`) source, as usual.
+**Anthropic API:** an `image` block with a `base64` source. Chat apps with image upload and terminal `/image`
+continue to upload bytes from the client. Server-local paths and `file:` URLs are rejected.
 
-JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF work (the last ones are converted to PNG first; agents such as omp send
-WebP). Chat apps with image upload work the same way.
+JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF are validated with Pillow and converted to RGB PNG before the native
+encoder. Limits: 16 MiB per encoded/normalized image, 16 million pixels, 16,000 pixels per dimension, and
+16 images per request; the API request-body limit also applies. Only the first animation frame is used.
+
+Remote image URLs are disabled by default. Administrators can allow exact HTTPS origins through
+`vision.image_origins`; only public destinations are accepted, and redirects are rejected. See
+[image input security](IMAGE_INPUT_SECURITY.md) for configuration and the remaining limits.
 
 ### Speed with images on (4K context, measured)
 

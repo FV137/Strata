@@ -56,3 +56,6 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Verified engine/source archive cache (retained for integrity checks and offline starts).
+/.cache/engine-artifacts/

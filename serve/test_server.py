@@ -724,6 +724,7 @@ class ClientShapes(unittest.TestCase):
                 raise BrokenPipeError("the encoder is gone")
 
         v = Vision.__new__(Vision)
+        v.image_origins = frozenset()
         v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
         v.proc = mock.Mock(stdin=Gone())
         with mock.patch.object(Vision, "load", return_value=b""), mock.patch.object(Vision, "normalize",
@@ -798,6 +799,16 @@ class SamplingKeys(unittest.TestCase):
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
+    def setUp(self):
+        # Exercise the compatibility path without nvidia-smi, independently of
+        # the test host. UUID/masked/container discovery has its own regression tests.
+        self.devices = mock.patch("serve.gpu_devices.nvidia_gpus", return_value=[])
+        self.devices.start()
+        self.addCleanup(self.devices.stop)
+        self.environment = mock.patch.dict(os.environ, {}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
     def test_env(self):
         from serve.server import child_env
         env = child_env({"gpu": 1})
@@ -828,6 +839,8 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(child_env({"backend": "hip", "gpu": [1, 0], "hip_ordinal": 2})["HIP_VISIBLE_DEVICES"],
                          "1,0")                                          # a layer split keeps its list
         self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": "x"})["HIP_VISIBLE_DEVICES"], "0")
+        self.assertEqual(child_env({"backend": "hip", "gpu": 0,
+                                    "env": {"HIP_VISIBLE_DEVICES": "1"}})["HIP_VISIBLE_DEVICES"], "1")
         plain = child_env({"backend": "hip"})
         self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
 
