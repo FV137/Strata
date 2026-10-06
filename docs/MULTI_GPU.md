@@ -41,6 +41,38 @@ now on; the answer is kept.
 --layer-split auto         (default) or the first layer of each later card, e.g. 18 or 16,32
 ```
 
+For example, install Orca on every eligible visible NVIDIA GPU with:
+
+```sh
+./setup.sh --setup --family orca --model Q4_K_M --gpus all --yes
+```
+
+To change an existing install's saved GPU selection, run `./setup.sh --gpus all --yes` (Windows:
+`START-HERE.bat --gpus all --yes`). `--gpu 0,2` is also accepted as an alias for `--gpus 0,2`; do not combine
+`--gpu` and `--gpus` in one command. Setup validates the requested cards before launching the engine.
+
+**RAM-budget models, including Orca.** The engine cannot combine `--resident-budget-gib` with a layer split.
+Without an explicit GPU selection, setup keeps the one-GPU recommendation for these models. With `--gpus`,
+setup uses the requested cards only when system RAM meets the model's split requirement (the model files plus
+24 GB of headroom); all experts then load into RAM. If RAM is insufficient, or `--resident-budget-gib` is also
+given, setup stops with the required RAM and a one-GPU command. It does not silently save a one-GPU config after
+an explicit multi-GPU request. Choose a smaller quant for a split, or use `--gpu N` with the RAM budget. Orca
+multi-GPU throughput has not been measured by these setup changes.
+
+**Containers and visibility masks.** Docker's `--gpus` exposes cards to the container; Strata's `GPUS` chooses
+which exposed cards share the model. For example, add `-e FAMILY=orca -e MODEL=Q4_K_M -e GPUS=all` to the
+documented `docker run --gpus all ...` command. A saved volume also accepts `GPUS=all` on a later start. Check
+`nvidia-smi` **inside the container** and use those numbers for `GPU` or `GPUS`.
+
+Setup respects `CUDA_VISIBLE_DEVICES`, including an empty mask (no GPUs). Numeric values in that variable are
+CUDA ordinals, which can differ from `nvidia-smi` numbers; setup asks the CUDA driver which GPU UUIDs they name.
+GPU UUIDs from `nvidia-smi --query-gpu=index,uuid --format=csv` avoid the numbering ambiguity. The engine gets
+the selected UUIDs in the requested order, so its `CUDA0` means the **first selected card**, not necessarily
+`nvidia-smi` GPU 0. A hidden or missing requested card stops the start with an error. MIG masks are not supported
+by this whole-GPU selection path and are rejected explicitly.
+NVIDIA documents the [visibility and remapping rules](https://docs.nvidia.com/deploy/topics/topic_5_2_1.html)
+and the [driver device/UUID queries](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__DEVICE.html).
+
 **Not supported** (setup says so and names the cards that can be used instead):
 - a card older than the RTX 20 series (compute capability below 7.5: GTX 10 and older);
 - a card with less than 8 GB of VRAM, together with others (each card holds a copy of the dense weights and its

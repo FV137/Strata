@@ -130,8 +130,8 @@ sizes are faster. Larger sizes are a bit smarter.
   while it answers, so it is slower there (an NVMe SSD helps).
 - **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
   model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
+- **[OrcaRouter's Uncensored quants](docs/ORCA_QUANTS.md):** all 15 published quantizations plus Q8_0-MTP,
+  experimental. Use `--family orca --model Q4_K_M` or choose another size; some formats require a source build.
 
 Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
 `SETUP.bat` (Linux: `./setup.sh --setup`).

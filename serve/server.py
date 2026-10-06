@@ -58,6 +58,7 @@ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import image_input, runconfig  # noqa: E402
 from serve.access import api_key_of, require_key_for_bind  # noqa: E402
 from serve.winjob import contain  # noqa: E402
+from serve.gpu_devices import cuda_device_value  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -1531,13 +1532,16 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
+    configured = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
     if hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
-    elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
-    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
-        env[str(k)] = str(v)
+        env.update(configured)                     # preserve HIP's existing config environment precedence
+    else:
+        env.update(configured)                     # apply a CUDA mask before checking the selected cards
+        if gpu_list(cfg):
+            # Resolve the inherited order before giving CUDA the selected UUIDs.
+            env["CUDA_VISIBLE_DEVICES"] = cuda_device_value(gpu_list(cfg), env, os.environ)
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -1557,7 +1561,10 @@ def vision_env(cfg: dict, env: dict) -> dict:
         env["HIP_VISIBLE_DEVICES"] = str(dev)
     else:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env["CUDA_VISIBLE_DEVICES"] = str(dev)
+        # The encoder may use a spare card outside the text engine's selection,
+        # but must still respect the launcher's (or config's) visibility mask.
+        parent = {**os.environ, **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}
+        env["CUDA_VISIBLE_DEVICES"] = cuda_device_value([int(dev)], parent, os.environ)
     return env
 
 
@@ -3959,7 +3966,11 @@ def main() -> int:
         if not cfg:
             ap.error("--engine strata needs --config")
         vision = None
-        env = child_env(cfg)
+        try:
+            env = child_env(cfg)
+            image_env = vision_env(cfg, env) if cfg.get("vision") else env
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -3974,7 +3985,7 @@ def main() -> int:
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env))
+                            env=image_env)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:

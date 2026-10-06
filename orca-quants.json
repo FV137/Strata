@@ -1,0 +1,326 @@
+{
+  "repository": "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+  "revision": "e43d00f4e2b8b40b89f75e9adeb1045ac34c8acc",
+  "variants": {
+    "IQ2_M": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ2_M-00001-of-00002.gguf",
+        "size": 44775849152,
+        "pointer_oid": "6915eeab4eecb879020fde0d0efcf4a54911651f",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ2_M-00002-of-00002.gguf",
+        "size": 35310443840,
+        "pointer_oid": "33bcaf02ec9dd98d65d8cf05a0340f942781527e",
+        "pointer_size": 136
+      }
+    ],
+    "IQ2_XXS": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ2_XXS-00001-of-00002.gguf",
+        "size": 44615966944,
+        "pointer_oid": "890d6045887d2c25f513818100abf9e7bb1313da",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ2_XXS-00002-of-00002.gguf",
+        "size": 30232371488,
+        "pointer_oid": "b85177e68c8a272e2bc7d1fb540e2c2b84c40774",
+        "pointer_size": 136
+      }
+    ],
+    "IQ3_M": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ3_M-00001-of-00002.gguf",
+        "size": 44706357824,
+        "pointer_oid": "7db0124109c3065409e6c4553cccedd015d2a873",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ3_M-00002-of-00002.gguf",
+        "size": 44834460608,
+        "pointer_oid": "1456ed743820952d9b52f2359740dcd56705f70c",
+        "pointer_size": 136
+      }
+    ],
+    "IQ3_XXS": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
+        "size": 44637691008,
+        "pointer_oid": "2ad0c0f2c36197f95d6aa941ee502ea9c3bc183d",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf",
+        "size": 40564977024,
+        "pointer_oid": "124f43ff27fb2a36ab314eb62a4863dadd35862a",
+        "pointer_size": 136
+      }
+    ],
+    "IQ4_XS": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf",
+        "size": 44766155936,
+        "pointer_oid": "339646831e724fe46eb51ca4799c263d6840a320",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00002-of-00003.gguf",
+        "size": 44735995008,
+        "pointer_oid": "e42b022846167d9c615a9a992e39d8cad4b92121",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00003-of-00003.gguf",
+        "size": 7971004256,
+        "pointer_oid": "cf88ce38f35e98098dd6208dcbdbf10d3b6b0df3",
+        "pointer_size": 135
+      }
+    ],
+    "Q2_K": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q2_K-00001-of-00002.gguf",
+        "size": 44893254944,
+        "pointer_oid": "b1673e516a93f9305963c1c60aeb741a04f10d03",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q2_K-00002-of-00002.gguf",
+        "size": 35554194880,
+        "pointer_oid": "f52aab41e6c4bece1c640a38a392c6540e1af17d",
+        "pointer_size": 136
+      }
+    ],
+    "Q3_K_L": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00001-of-00003.gguf",
+        "size": 44998470112,
+        "pointer_oid": "d249b5e4bccdcb7c0df04cb6993c63bd5d1cf3c9",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00002-of-00003.gguf",
+        "size": 44703161920,
+        "pointer_oid": "6aefa7e7fbde9656fb0938fc39f83aa609b34080",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00003-of-00003.gguf",
+        "size": 6954767936,
+        "pointer_oid": "3c2e85c0b6352da51fc33b9a95e29914b9ef171c",
+        "pointer_size": 135
+      }
+    ],
+    "Q3_K_M": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00001-of-00003.gguf",
+        "size": 44560035232,
+        "pointer_oid": "04dcd8e432ea63e27fdd1fb99102b6c0a11f17d5",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00002-of-00003.gguf",
+        "size": 44814036288,
+        "pointer_oid": "13b60aafcd965fa69042824215c3c2a24581f7d6",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00003-of-00003.gguf",
+        "size": 4763021984,
+        "pointer_oid": "d96932d09967cdd7858417947feacc1248964fa0",
+        "pointer_size": 135
+      }
+    ],
+    "Q3_K_S": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_S-00001-of-00002.gguf",
+        "size": 44897102432,
+        "pointer_oid": "b1badc53be9c7a18ad218c8a360893c31d8f9ab8",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q3_K_S-00002-of-00002.gguf",
+        "size": 43858236352,
+        "pointer_oid": "391a658095024b6a844e32fbf22ce99bdb3738fb",
+        "pointer_size": 136
+      }
+    ],
+    "Q4_K_M": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00001-of-00003.gguf",
+        "size": 44598509600,
+        "pointer_oid": "cbaf0859b718a4744afb7af0d3c594d820103fd0",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00002-of-00003.gguf",
+        "size": 44693535520,
+        "pointer_oid": "1b7b175cf91b3ae6fc14bc511fc21a775469e54b",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00003-of-00003.gguf",
+        "size": 29858677824,
+        "pointer_oid": "b0bb10f5359998902193830667523c29023c36b4",
+        "pointer_size": 136
+      }
+    ],
+    "Q4_K_S": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00001-of-00003.gguf",
+        "size": 44888775360,
+        "pointer_oid": "dbc1d6946496de863b4633e72d9010c065b27522",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00002-of-00003.gguf",
+        "size": 44934400672,
+        "pointer_oid": "02b3efc93cbf55eb79b430005f24e2660bc9fa51",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00003-of-00003.gguf",
+        "size": 21946739488,
+        "pointer_oid": "388486eec02ef9c0d2a6754a89a7747c1b65e5f1",
+        "pointer_size": 136
+      }
+    ],
+    "Q5_K_M": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+        "size": 44537339136,
+        "pointer_oid": "78a759eb9c3250b7c1da86ec2159f5840f9856bd",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00002-of-00003.gguf",
+        "size": 44714628064,
+        "pointer_oid": "2b9112572b44292fed6e55a500c9a87190eac2db",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00003-of-00003.gguf",
+        "size": 44854700960,
+        "pointer_oid": "33a5aab6eed3ba64364e7b00357c46f7ac4b3395",
+        "pointer_size": 136
+      }
+    ],
+    "Q5_K_S": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf",
+        "size": 44953947904,
+        "pointer_oid": "2c481ab0590561ad4d7a7a1ca85939e0d13717c6",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00002-of-00003.gguf",
+        "size": 44796192320,
+        "pointer_oid": "03d487d7cbc223a390631c16b905803d75927358",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00003-of-00003.gguf",
+        "size": 37978625856,
+        "pointer_oid": "9467bf8ccc178b965b1b1e82bbefd4b36272b0cc",
+        "pointer_size": 136
+      }
+    ],
+    "Q6_K": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q6_K-00001-of-00005.gguf",
+        "size": 538628576,
+        "pointer_oid": "534f2d12899b7d5b2246aff55cbcbab1af96889d",
+        "pointer_size": 134
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q6_K-00002-of-00005.gguf",
+        "size": 54400261312,
+        "pointer_oid": "766778caaa60509ea54718bf10bf8a31a6261ad0",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q6_K-00003-of-00005.gguf",
+        "size": 46573481408,
+        "pointer_oid": "918ccfef4a2641cd05f8a2abc13db7f390e40394",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q6_K-00004-of-00005.gguf",
+        "size": 46730163488,
+        "pointer_oid": "c54c27255a4fb06717a526b710b93a88db010d8b",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q6_K-00005-of-00005.gguf",
+        "size": 19397304512,
+        "pointer_oid": "cee53ef64717e861c5a72c6b6b7b1cf8976cb648",
+        "pointer_size": 136
+      }
+    ],
+    "Q8_0": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-00001-of-00005.gguf",
+        "size": 5566294560,
+        "pointer_oid": "9557727fbf1236755518880c83ef9c1d43075d8d",
+        "pointer_size": 135
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-00002-of-00005.gguf",
+        "size": 54400261312,
+        "pointer_oid": "766778caaa60509ea54718bf10bf8a31a6261ad0",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-00003-of-00005.gguf",
+        "size": 46969998688,
+        "pointer_oid": "18e2398ecc1bdb42b00e697baf4d8b25cf420448",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-00004-of-00005.gguf",
+        "size": 46887247200,
+        "pointer_oid": "641b7665a284a51a4c6a920a170edfed853faf9f",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-00005-of-00005.gguf",
+        "size": 34382716608,
+        "pointer_oid": "b7a1a85b642d19093797ab75881ce596cb9879fb",
+        "pointer_size": 136
+      }
+    ],
+    "Q8_0-MTP": [
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00001-of-00005.gguf",
+        "size": 5566294592,
+        "pointer_oid": "f2709aee765b8ee911b5688013678b4a42810317",
+        "pointer_size": 135
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00002-of-00005.gguf",
+        "size": 54400261312,
+        "pointer_oid": "45e8a8121b3813937d246512f0ed5e547db32fe8",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00003-of-00005.gguf",
+        "size": 46903029984,
+        "pointer_oid": "144a1d5914fc4b78a3c7571a61b718bff8950229",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00004-of-00005.gguf",
+        "size": 46901260896,
+        "pointer_oid": "d6435bfd21bf2f583e32c7263720c862752b119f",
+        "pointer_size": 136
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00005-of-00005.gguf",
+        "size": 37209759328,
+        "pointer_oid": "23870c3888d8616c9abdddc37127a94e7cde9bc3",
+        "pointer_size": 136
+      }
+    ]
+  }
+}

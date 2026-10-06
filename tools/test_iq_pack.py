@@ -37,6 +37,44 @@ def write_gguf(path, tensors, split=None, arch=True):
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_k_quant_packs_keep_experts_native_and_convert_control_projections(self):
+        # gguf-py decodes these formats but does not quantize them. Construct small finite
+        # encoded blocks to exercise the same native bytes the published GGUFs carry.
+        for kind, block_bytes in ((Q.Q2_K, 84), (Q.Q3_K, 110), (Q.Q6_K, 210)):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "model.gguf"
+                writer = GGUFWriter(source, "qwen4exp")
+                block = np.arange(block_bytes, dtype=np.uint8)
+                block[-2:] = np.frombuffer(np.float16(0.125).tobytes(), dtype=np.uint8)
+                if kind == Q.Q2_K:
+                    block[-4:-2] = np.frombuffer(np.float16(0.25).tobytes(), dtype=np.uint8)
+                gu = np.tile(block, (4, 32, 1))
+                writer.add_tensor("blk.0.ffn_gate_exps.weight", gu, raw_dtype=kind)
+                writer.add_tensor("blk.0.ffn_up_exps.weight", gu, raw_dtype=kind)
+                down = quants.quantize(np.ones((4, 256, 32), np.float32), Q.Q8_0)
+                writer.add_tensor("blk.0.ffn_down_exps.weight", down, raw_dtype=Q.Q8_0)
+                writer.add_tensor("blk.0.ffn_gate_inp.weight", np.ones((4, 256), np.float32))
+                writer.add_tensor("blk.0.hc_attn_down.weight", block.reshape(1, -1), raw_dtype=kind)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                before = source.read_bytes()
+                code, output = run_pack(source, root / "pack", "--compat-bf16")
+                self.assertEqual(code, 0, output)
+                self.assertEqual(source.read_bytes(), before)
+                self.assertFalse((root / "pack" / "experts.bin").exists())
+                model = iq_pack.Model(source)
+                self.assertEqual(model.bytes("blk.0.ffn_gate_exps.weight").tobytes(), gu.tobytes())
+                layout, _, _, _ = iq_pack.expert_layout(model, source)
+                self.assertEqual(layout[0][1:3], (int(kind), int(Q.Q8_0)))
+                _, rows = iq_pack.read_index(root / "pack" / "index.txt")
+                row = rows["blk.0.hc_attn_down.weight"]
+                dense = (root / "pack" / "dense.bin").read_bytes()
+                expected = quants.quantize(quants.dequantize(block.reshape(1, -1), kind), Q.BF16).tobytes()
+                self.assertEqual(dense[int(row[3]):int(row[3]) + int(row[4])], expected)
+
     def test_bf16_halfway_rounds_to_even(self):
         values = np.array([0x3F808000, 0x3F818000, 0xBF808000, 0xBF818000], dtype=np.uint32)
         got = np.frombuffer(iq_pack.bf16_bytes(values.view(np.uint8), "F32"), dtype=np.uint16)

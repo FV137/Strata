@@ -122,7 +122,7 @@ class GgufDirUnsupported(unittest.TestCase):
         self.assertEqual(msg, "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf is UD-IQ3_XXS, a GGUF Strata "
                               "cannot run")
         self.assertIn("ISTA-DASLab's GSQ-RCO files", hint)
-        self.assertIn("OrcaRouter Uncensored Q4_K_M", hint)
+        self.assertIn("published OrcaRouter Uncensored quants", hint)
 
     def test_a_folder_without_the_choice_names_what_is_there(self):
         gsq = ["Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-%05d-of-00002.gguf" % i for i in (1, 2)]
@@ -146,7 +146,7 @@ class GgufDirUnsupported(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("has no IQ3_XXS model file", out)
         self.assertIn("choose one of: UD-IQ4_XS, UD-Q4_K_XL (or IQ3_XXS: --family qwen --model IQ3_XXS, --family swift --model "
-                      "IQ3_XXS)", out)
+                      "IQ3_XXS, --family orca --model IQ3_XXS)", out)
         self.assertIn("Strata runs ISTA-DASLab's GSQ-RCO files", out)
 
 

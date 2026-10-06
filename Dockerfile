@@ -37,10 +37,12 @@
 # deliberately by changing the host side of -p; the example above is local only. Pass
 # -e REINSTALL=1 to change the model settings later.
 #
-# --gpus all on a host with two usable cards: setup takes both (the layer split is
-# its recommended default). Pin one card with -e GPU=0, or name them with
-# -e GPUS=0,2. A volume set up for one card switches to the pair on its first start
-# on a two-card host unless GPU or GPUS pins it. LOW_RAM=on runs on one card.
+# Docker's --gpus exposes devices; -e GPUS=all explicitly asks Strata to split
+# across all eligible visible cards (including an existing volume). Pin one with
+# -e GPU=0, or name cards with -e GPUS=0,2, using nvidia-smi inside the container.
+# RAM-budget models (including Orca) default to one GPU; an explicit split needs
+# enough host RAM for the model files plus headroom and stops if it cannot fit.
+# See docs/MULTI_GPU.md for selection, CUDA visibility, and low-RAM constraints.
 
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
 

@@ -1,7 +1,7 @@
 // src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
-// The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
+// The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q2_K/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -88,6 +88,15 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         for (int j = 0; j < 16; ++j) {
             put(out, j, d * (float) kv_iq4nl[b[2 + j] & 0xf]);
             put(out, j + 16, d * (float) kv_iq4nl[b[2 + j] >> 4]);
+        }
+    } else if constexpr (TYPE == 10) {                             // Q2_K: scales[16] qs[64] d dmin
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 84;
+        const int gi = gi_in_row % 8, n = gi / 4, shift = 2 * (gi % 4);
+        const float d = h2f(b + 80), dmin = h2f(b + 82);
+        const uint8_t* q = b + 16 + 32 * n;
+        for (int j = 0; j < 32; ++j) {
+            const uint8_t sc = b[2 * gi + j / 16];
+            put(out, j, d * (sc & 15) * ((q[j] >> shift) & 3) - dmin * (sc >> 4));
         }
     } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
@@ -181,6 +190,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
+    case 10: block_elems = 256; block_bytes = 84; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
     case 12: block_elems = 256; block_bytes = 144; return true;
     case 13: block_elems = 256; block_bytes = 176; return true;
@@ -209,6 +219,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 6: STRATA_DQ(6);
     case 7: STRATA_DQ(7);
     case 8: STRATA_DQ(8);
+    case 10: STRATA_DQ(10);
     case 11: STRATA_DQ(11);
     case 12: STRATA_DQ(12);
     case 13: STRATA_DQ(13);

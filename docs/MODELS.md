@@ -144,8 +144,9 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 
 ### OrcaRouter Uncensored IQ3_XXS
 
-For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an
-explicit packing conversion and is not an installer menu option.
+For **OrcaRouter's Flash-Next Uncensored**, use the [quantization installer guide](ORCA_QUANTS.md).
+All 15 published quantizations plus Q8_0-MTP have separate experimental installer choices. The
+[historical IQ3_XXS compatibility report](ORCA.md) describes its packing conversion and measured setup.
 
 ## Adding or switching models
 
